@@ -1,0 +1,4 @@
+* text=auto eol=lf
+# Archived demo hashes refer to exact bytes, including CSV CRLF endings.
+examples/demo-result/** -text
+*.csv -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

@@ -1,0 +1,780 @@
+{
+  "provenance": {
+    "cluster_version": "v7.1.9-0.3",
+    "core_version": "v8.5.5",
+    "edition": "Enterprise",
+    "git_hash": "2b65874746aacb6903a283889fca9e45061e0185",
+    "captured_date": "2026-10-11",
+    "schema": "pcc_validation_20261011",
+    "method": "ordinary EXPLAIN on generated fixtures; raw rows preserved"
+  },
+  "cases": [
+    {
+      "name": "index_join",
+      "sql": "SELECT /*+ INL_JOIN(o) */ c.name,o.id FROM customers c JOIN orders o ON o.customer_id=c.id WHERE c.region=2",
+      "snapshot": {
+        "query_id": "q_6e17817804383c14d2a3a848fc9a6668b423f22c7479af274621e2d661acf023",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "row",
+        "columns": [
+          "id",
+          "estRows",
+          "task",
+          "access object",
+          "operator info"
+        ],
+        "rows": [
+          [
+            "IndexJoin_15",
+            "200.00",
+            "root",
+            "",
+            "inner join, inner:IndexReader_14, outer key:pcc_validation_20261011.customers.id, inner key:pcc_validation_20261011.orders.customer_id, equal cond:eq(pcc_validation_20261011.customers.id, pcc_validation_20261011.orders.customer_id)"
+          ],
+          [
+            "├─TableReader_35(Build)",
+            "20.00",
+            "root",
+            "",
+            "data:Selection_34"
+          ],
+          [
+            "│ └─Selection_34",
+            "20.00",
+            "cop[tikv]",
+            "",
+            "eq(pcc_validation_20261011.customers.region, 2)"
+          ],
+          [
+            "│   └─TableFullScan_33",
+            "100.00",
+            "cop[tikv]",
+            "table:c",
+            "keep order:false"
+          ],
+          [
+            "└─IndexReader_14(Probe)",
+            "200.00",
+            "root",
+            "",
+            "index:IndexRangeScan_13"
+          ],
+          [
+            "  └─IndexRangeScan_13",
+            "200.00",
+            "cop[tikv]",
+            "table:o, index:idx_customer(customer_id)",
+            "range: decided by [eq(pcc_validation_20261011.orders.customer_id, pcc_validation_20261011.customers.id)], keep order:false"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "index_join",
+      "sql": "SELECT /*+ INL_JOIN(o) */ c.name,o.id FROM customers c JOIN orders o ON o.customer_id=c.id WHERE c.region=2",
+      "snapshot": {
+        "query_id": "q_6e17817804383c14d2a3a848fc9a6668b423f22c7479af274621e2d661acf023",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "tidb_json",
+        "columns": [
+          "TiDB_JSON"
+        ],
+        "rows": [
+          [
+            "[\n    {\n        \"id\": \"IndexJoin_15\",\n        \"estRows\": \"200.00\",\n        \"taskType\": \"root\",\n        \"operatorInfo\": \"inner join, inner:IndexReader_14, outer key:pcc_validation_20261011.customers.id, inner key:pcc_validation_20261011.orders.customer_id, equal cond:eq(pcc_validation_20261011.customers.id, pcc_validation_20261011.orders.customer_id)\",\n        \"subOperators\": [\n            {\n                \"id\": \"TableReader_35(Build)\",\n                \"estRows\": \"20.00\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"data:Selection_34\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"Selection_34\",\n                        \"estRows\": \"20.00\",\n                        \"taskType\": \"cop[tikv]\",\n                        \"operatorInfo\": \"eq(pcc_validation_20261011.customers.region, 2)\",\n                        \"subOperators\": [\n                            {\n                                \"id\": \"TableFullScan_33\",\n                                \"estRows\": \"100.00\",\n                                \"taskType\": \"cop[tikv]\",\n                                \"accessObject\": \"table:c\",\n                                \"operatorInfo\": \"keep order:false\"\n                            }\n                        ]\n                    }\n                ]\n            },\n            {\n                \"id\": \"IndexReader_14(Probe)\",\n                \"estRows\": \"200.00\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"index:IndexRangeScan_13\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"IndexRangeScan_13\",\n                        \"estRows\": \"200.00\",\n                        \"taskType\": \"cop[tikv]\",\n                        \"accessObject\": \"table:o, index:idx_customer(customer_id)\",\n                        \"operatorInfo\": \"range: decided by [eq(pcc_validation_20261011.orders.customer_id, pcc_validation_20261011.customers.id)], keep order:false\"\n                    }\n                ]\n            }\n        ]\n    }\n]\n"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "correlated",
+      "sql": "SELECT o.id,(SELECT MAX(i.price) FROM items i WHERE i.order_id=o.id) FROM orders o WHERE o.id<20",
+      "snapshot": {
+        "query_id": "q_961f87fe13ca787cec016b3cec4bdf1108077069d0764b2bdc957ee1daaf88a6",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "row",
+        "columns": [
+          "id",
+          "estRows",
+          "task",
+          "access object",
+          "operator info"
+        ],
+        "rows": [
+          [
+            "HashAgg_13",
+            "19.00",
+            "root",
+            "",
+            "group by:pcc_validation_20261011.orders.id, funcs:firstrow(pcc_validation_20261011.orders.id)->pcc_validation_20261011.orders.id, funcs:max(pcc_validation_20261011.items.price)->Column#14"
+          ],
+          [
+            "└─IndexHashJoin_24",
+            "38.00",
+            "root",
+            "",
+            "left outer join, inner:IndexLookUp_21, outer key:pcc_validation_20261011.orders.id, inner key:pcc_validation_20261011.items.order_id, equal cond:eq(pcc_validation_20261011.orders.id, pcc_validation_20261011.items.order_id)"
+          ],
+          [
+            "  ├─TableReader_39(Build)",
+            "19.00",
+            "root",
+            "",
+            "data:TableRangeScan_38"
+          ],
+          [
+            "  │ └─TableRangeScan_38",
+            "19.00",
+            "cop[tikv]",
+            "table:o",
+            "range:[-inf,20), keep order:false"
+          ],
+          [
+            "  └─IndexLookUp_21(Probe)",
+            "38.00",
+            "root",
+            "",
+            ""
+          ],
+          [
+            "    ├─Selection_20(Build)",
+            "38.00",
+            "cop[tikv]",
+            "",
+            "lt(pcc_validation_20261011.items.order_id, 20)"
+          ],
+          [
+            "    │ └─IndexRangeScan_18",
+            "2000.00",
+            "cop[tikv]",
+            "table:i, index:idx_order(order_id)",
+            "range: decided by [eq(pcc_validation_20261011.items.order_id, pcc_validation_20261011.orders.id)], keep order:false"
+          ],
+          [
+            "    └─TableRowIDScan_19(Probe)",
+            "38.00",
+            "cop[tikv]",
+            "table:i",
+            "keep order:false"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "correlated",
+      "sql": "SELECT o.id,(SELECT MAX(i.price) FROM items i WHERE i.order_id=o.id) FROM orders o WHERE o.id<20",
+      "snapshot": {
+        "query_id": "q_961f87fe13ca787cec016b3cec4bdf1108077069d0764b2bdc957ee1daaf88a6",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "tidb_json",
+        "columns": [
+          "TiDB_JSON"
+        ],
+        "rows": [
+          [
+            "[\n    {\n        \"id\": \"HashAgg_13\",\n        \"estRows\": \"19.00\",\n        \"taskType\": \"root\",\n        \"operatorInfo\": \"group by:pcc_validation_20261011.orders.id, funcs:firstrow(pcc_validation_20261011.orders.id)->pcc_validation_20261011.orders.id, funcs:max(pcc_validation_20261011.items.price)->Column#14\",\n        \"subOperators\": [\n            {\n                \"id\": \"IndexHashJoin_24\",\n                \"estRows\": \"38.00\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"left outer join, inner:IndexLookUp_21, outer key:pcc_validation_20261011.orders.id, inner key:pcc_validation_20261011.items.order_id, equal cond:eq(pcc_validation_20261011.orders.id, pcc_validation_20261011.items.order_id)\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"TableReader_39(Build)\",\n                        \"estRows\": \"19.00\",\n                        \"taskType\": \"root\",\n                        \"operatorInfo\": \"data:TableRangeScan_38\",\n                        \"subOperators\": [\n                            {\n                                \"id\": \"TableRangeScan_38\",\n                                \"estRows\": \"19.00\",\n                                \"taskType\": \"cop[tikv]\",\n                                \"accessObject\": \"table:o\",\n                                \"operatorInfo\": \"range:[-inf,20), keep order:false\"\n                            }\n                        ]\n                    },\n                    {\n                        \"id\": \"IndexLookUp_21(Probe)\",\n                        \"estRows\": \"38.00\",\n                        \"taskType\": \"root\",\n                        \"subOperators\": [\n                            {\n                                \"id\": \"Selection_20(Build)\",\n                                \"estRows\": \"38.00\",\n                                \"taskType\": \"cop[tikv]\",\n                                \"operatorInfo\": \"lt(pcc_validation_20261011.items.order_id, 20)\",\n                                \"subOperators\": [\n                                    {\n                                        \"id\": \"IndexRangeScan_18\",\n                                        \"estRows\": \"2000.00\",\n                                        \"taskType\": \"cop[tikv]\",\n                                        \"accessObject\": \"table:i, index:idx_order(order_id)\",\n                                        \"operatorInfo\": \"range: decided by [eq(pcc_validation_20261011.items.order_id, pcc_validation_20261011.orders.id)], keep order:false\"\n                                    }\n                                ]\n                            },\n                            {\n                                \"id\": \"TableRowIDScan_19(Probe)\",\n                                \"estRows\": \"38.00\",\n                                \"taskType\": \"cop[tikv]\",\n                                \"accessObject\": \"table:i\",\n                                \"operatorInfo\": \"keep order:false\"\n                            }\n                        ]\n                    }\n                ]\n            }\n        ]\n    }\n]\n"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cte",
+      "sql": "WITH high_orders AS (SELECT id,amount FROM orders WHERE amount>1000) SELECT COUNT(*) FROM high_orders",
+      "snapshot": {
+        "query_id": "q_18f364a3895df72a6c9e3413aaf5bc9544b41620adfcb4ca5d9c4920bf32bd2e",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "row",
+        "columns": [
+          "id",
+          "estRows",
+          "task",
+          "access object",
+          "operator info"
+        ],
+        "rows": [
+          [
+            "StreamAgg_22",
+            "1.00",
+            "root",
+            "",
+            "funcs:count(Column#15)->Column#13"
+          ],
+          [
+            "└─IndexReader_23",
+            "1.00",
+            "root",
+            "",
+            "index:StreamAgg_14"
+          ],
+          [
+            "  └─StreamAgg_14",
+            "1.00",
+            "cop[tikv]",
+            "",
+            "funcs:count(1)->Column#15"
+          ],
+          [
+            "    └─IndexRangeScan_21",
+            "486.80",
+            "cop[tikv]",
+            "table:orders, index:idx_amount(amount)",
+            "range:(1000,+inf], keep order:false"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cte",
+      "sql": "WITH high_orders AS (SELECT id,amount FROM orders WHERE amount>1000) SELECT COUNT(*) FROM high_orders",
+      "snapshot": {
+        "query_id": "q_18f364a3895df72a6c9e3413aaf5bc9544b41620adfcb4ca5d9c4920bf32bd2e",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "tidb_json",
+        "columns": [
+          "TiDB_JSON"
+        ],
+        "rows": [
+          [
+            "[\n    {\n        \"id\": \"StreamAgg_22\",\n        \"estRows\": \"1.00\",\n        \"taskType\": \"root\",\n        \"operatorInfo\": \"funcs:count(Column#15)->Column#13\",\n        \"subOperators\": [\n            {\n                \"id\": \"IndexReader_23\",\n                \"estRows\": \"1.00\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"index:StreamAgg_14\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"StreamAgg_14\",\n                        \"estRows\": \"1.00\",\n                        \"taskType\": \"cop[tikv]\",\n                        \"operatorInfo\": \"funcs:count(1)->Column#15\",\n                        \"subOperators\": [\n                            {\n                                \"id\": \"IndexRangeScan_21\",\n                                \"estRows\": \"486.80\",\n                                \"taskType\": \"cop[tikv]\",\n                                \"accessObject\": \"table:orders, index:idx_amount(amount)\",\n                                \"operatorInfo\": \"range:(1000,+inf], keep order:false\"\n                            }\n                        ]\n                    }\n                ]\n            }\n        ]\n    }\n]\n"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cte_reuse",
+      "sql": "WITH totals AS (SELECT customer_id,SUM(amount) AS total FROM orders GROUP BY customer_id) SELECT a.customer_id FROM totals a JOIN totals b ON a.customer_id=b.customer_id WHERE a.total>10000",
+      "snapshot": {
+        "query_id": "q_e9bb7e6648792c615b4777d7ac9a6465e68249537e4a872ccab22417cec0a744",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "row",
+        "columns": [
+          "id",
+          "estRows",
+          "task",
+          "access object",
+          "operator info"
+        ],
+        "rows": [
+          [
+            "HashJoin_32",
+            "64.00",
+            "root",
+            "",
+            "inner join, equal:[eq(pcc_validation_20261011.orders.customer_id, pcc_validation_20261011.orders.customer_id)]"
+          ],
+          [
+            "├─Selection_36(Build)",
+            "64.00",
+            "root",
+            "",
+            "not(isnull(pcc_validation_20261011.orders.customer_id))"
+          ],
+          [
+            "│ └─CTEFullScan_37",
+            "80.00",
+            "root",
+            "CTE:totals AS b",
+            "data:CTE_0"
+          ],
+          [
+            "└─Selection_34(Probe)",
+            "64.00",
+            "root",
+            "",
+            "gt(Column#8, 10000), not(isnull(pcc_validation_20261011.orders.customer_id))"
+          ],
+          [
+            "  └─CTEFullScan_35",
+            "80.00",
+            "root",
+            "CTE:totals AS a",
+            "data:CTE_0"
+          ],
+          [
+            "CTE_0",
+            "80.00",
+            "root",
+            "",
+            "Non-Recursive CTE"
+          ],
+          [
+            "└─Projection_14(Seed Part)",
+            "80.00",
+            "root",
+            "",
+            "pcc_validation_20261011.orders.customer_id, Column#6"
+          ],
+          [
+            "  └─Selection_15",
+            "80.00",
+            "root",
+            "",
+            "or(and(1, gt(Column#6, 10000)), 1)"
+          ],
+          [
+            "    └─HashAgg_22",
+            "100.00",
+            "root",
+            "",
+            "group by:pcc_validation_20261011.orders.customer_id, funcs:sum(Column#11)->Column#6, funcs:firstrow(pcc_validation_20261011.orders.customer_id)->pcc_validation_20261011.orders.customer_id"
+          ],
+          [
+            "      └─TableReader_23",
+            "100.00",
+            "root",
+            "",
+            "data:HashAgg_16"
+          ],
+          [
+            "        └─HashAgg_16",
+            "100.00",
+            "cop[tikv]",
+            "",
+            "group by:pcc_validation_20261011.orders.customer_id, funcs:sum(pcc_validation_20261011.orders.amount)->Column#11"
+          ],
+          [
+            "          └─TableFullScan_21",
+            "1000.00",
+            "cop[tikv]",
+            "table:orders",
+            "keep order:false"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cte_reuse",
+      "sql": "WITH totals AS (SELECT customer_id,SUM(amount) AS total FROM orders GROUP BY customer_id) SELECT a.customer_id FROM totals a JOIN totals b ON a.customer_id=b.customer_id WHERE a.total>10000",
+      "snapshot": {
+        "query_id": "q_e9bb7e6648792c615b4777d7ac9a6465e68249537e4a872ccab22417cec0a744",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "tidb_json",
+        "columns": [
+          "TiDB_JSON"
+        ],
+        "rows": [
+          [
+            "[\n    {\n        \"id\": \"HashJoin_32\",\n        \"estRows\": \"64.00\",\n        \"taskType\": \"root\",\n        \"operatorInfo\": \"inner join, equal:[eq(pcc_validation_20261011.orders.customer_id, pcc_validation_20261011.orders.customer_id)]\",\n        \"subOperators\": [\n            {\n                \"id\": \"Selection_36(Build)\",\n                \"estRows\": \"64.00\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"not(isnull(pcc_validation_20261011.orders.customer_id))\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"CTEFullScan_37\",\n                        \"estRows\": \"80.00\",\n                        \"taskType\": \"root\",\n                        \"accessObject\": \"CTE:totals AS b\",\n                        \"operatorInfo\": \"data:CTE_0\"\n                    }\n                ]\n            },\n            {\n                \"id\": \"Selection_34(Probe)\",\n                \"estRows\": \"64.00\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"gt(Column#8, 10000), not(isnull(pcc_validation_20261011.orders.customer_id))\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"CTEFullScan_35\",\n                        \"estRows\": \"80.00\",\n                        \"taskType\": \"root\",\n                        \"accessObject\": \"CTE:totals AS a\",\n                        \"operatorInfo\": \"data:CTE_0\"\n                    }\n                ]\n            }\n        ]\n    },\n    {\n        \"id\": \"CTE_0\",\n        \"estRows\": \"80.00\",\n        \"taskType\": \"root\",\n        \"operatorInfo\": \"Non-Recursive CTE\",\n        \"subOperators\": [\n            {\n                \"id\": \"Projection_14(Seed Part)\",\n                \"estRows\": \"80.00\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"pcc_validation_20261011.orders.customer_id, Column#6\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"Selection_15\",\n                        \"estRows\": \"80.00\",\n                        \"taskType\": \"root\",\n                        \"operatorInfo\": \"or(and(1, gt(Column#6, 10000)), 1)\",\n                        \"subOperators\": [\n                            {\n                                \"id\": \"HashAgg_22\",\n                                \"estRows\": \"100.00\",\n                                \"taskType\": \"root\",\n                                \"operatorInfo\": \"group by:pcc_validation_20261011.orders.customer_id, funcs:sum(Column#11)->Column#6, funcs:firstrow(pcc_validation_20261011.orders.customer_id)->pcc_validation_20261011.orders.customer_id\",\n                                \"subOperators\": [\n                                    {\n                                        \"id\": \"TableReader_23\",\n                                        \"estRows\": \"100.00\",\n                                        \"taskType\": \"root\",\n                                        \"operatorInfo\": \"data:HashAgg_16\",\n                                        \"subOperators\": [\n                                            {\n                                                \"id\": \"HashAgg_16\",\n                                                \"estRows\": \"100.00\",\n                                                \"taskType\": \"cop[tikv]\",\n                                                \"operatorInfo\": \"group by:pcc_validation_20261011.orders.customer_id, funcs:sum(pcc_validation_20261011.orders.amount)->Column#11\",\n                                                \"subOperators\": [\n                                                    {\n                                                        \"id\": \"TableFullScan_21\",\n                                                        \"estRows\": \"1000.00\",\n                                                        \"taskType\": \"cop[tikv]\",\n                                                        \"accessObject\": \"table:orders\",\n                                                        \"operatorInfo\": \"keep order:false\"\n                                                    }\n                                                ]\n                                            }\n                                        ]\n                                    }\n                                ]\n                            }\n                        ]\n                    }\n                ]\n            }\n        ]\n    }\n]\n"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "recursive_cte",
+      "sql": "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<5) SELECT * FROM seq",
+      "snapshot": {
+        "query_id": "q_f1927e36fc5ae34eda7e603e4b5c98f7a6d677be0c450d10181392c65cbf4808",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "row",
+        "columns": [
+          "id",
+          "estRows",
+          "task",
+          "access object",
+          "operator info"
+        ],
+        "rows": [
+          [
+            "CTEFullScan_17",
+            "1.80",
+            "root",
+            "CTE:seq",
+            "data:CTE_0"
+          ],
+          [
+            "CTE_0",
+            "1.80",
+            "root",
+            "",
+            "Recursive CTE"
+          ],
+          [
+            "├─Projection_11(Seed Part)",
+            "1.00",
+            "root",
+            "",
+            "1->Column#2"
+          ],
+          [
+            "│ └─TableDual_12",
+            "1.00",
+            "root",
+            "",
+            "rows:1"
+          ],
+          [
+            "└─Projection_13(Recursive Part)",
+            "0.80",
+            "root",
+            "",
+            "cast(plus(Column#3, 1), bigint BINARY)->Column#5"
+          ],
+          [
+            "  └─Selection_14",
+            "0.80",
+            "root",
+            "",
+            "lt(Column#3, 5)"
+          ],
+          [
+            "    └─CTETable_15",
+            "1.00",
+            "root",
+            "",
+            "Scan on CTE_0"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "recursive_cte",
+      "sql": "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<5) SELECT * FROM seq",
+      "snapshot": {
+        "query_id": "q_f1927e36fc5ae34eda7e603e4b5c98f7a6d677be0c450d10181392c65cbf4808",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "tidb_json",
+        "columns": [
+          "TiDB_JSON"
+        ],
+        "rows": [
+          [
+            "[\n    {\n        \"id\": \"CTEFullScan_17\",\n        \"estRows\": \"1.80\",\n        \"taskType\": \"root\",\n        \"accessObject\": \"CTE:seq\",\n        \"operatorInfo\": \"data:CTE_0\"\n    },\n    {\n        \"id\": \"CTE_0\",\n        \"estRows\": \"1.80\",\n        \"taskType\": \"root\",\n        \"operatorInfo\": \"Recursive CTE\",\n        \"subOperators\": [\n            {\n                \"id\": \"Projection_11(Seed Part)\",\n                \"estRows\": \"1.00\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"1->Column#2\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"TableDual_12\",\n                        \"estRows\": \"1.00\",\n                        \"taskType\": \"root\",\n                        \"operatorInfo\": \"rows:1\"\n                    }\n                ]\n            },\n            {\n                \"id\": \"Projection_13(Recursive Part)\",\n                \"estRows\": \"0.80\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"cast(plus(Column#3, 1), bigint BINARY)->Column#5\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"Selection_14\",\n                        \"estRows\": \"0.80\",\n                        \"taskType\": \"root\",\n                        \"operatorInfo\": \"lt(Column#3, 5)\",\n                        \"subOperators\": [\n                            {\n                                \"id\": \"CTETable_15\",\n                                \"estRows\": \"1.00\",\n                                \"taskType\": \"root\",\n                                \"operatorInfo\": \"Scan on CTE_0\"\n                            }\n                        ]\n                    }\n                ]\n            }\n        ]\n    }\n]\n"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "union_all",
+      "sql": "SELECT id FROM orders WHERE id<3 UNION ALL SELECT id FROM orders WHERE id>998",
+      "snapshot": {
+        "query_id": "q_2effce0d3e4f0728f09cad806e0ca8689fe9c6d9fdd7efd45d3a7c6a41eb78c7",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "row",
+        "columns": [
+          "id",
+          "estRows",
+          "task",
+          "access object",
+          "operator info"
+        ],
+        "rows": [
+          [
+            "Union_10",
+            "4.00",
+            "root",
+            "",
+            ""
+          ],
+          [
+            "├─TableReader_13",
+            "2.00",
+            "root",
+            "",
+            "data:TableRangeScan_12"
+          ],
+          [
+            "│ └─TableRangeScan_12",
+            "2.00",
+            "cop[tikv]",
+            "table:orders",
+            "range:[-inf,3), keep order:false"
+          ],
+          [
+            "└─TableReader_16",
+            "3.00",
+            "root",
+            "",
+            "data:TableRangeScan_15"
+          ],
+          [
+            "  └─TableRangeScan_15",
+            "3.00",
+            "cop[tikv]",
+            "table:orders",
+            "range:(998,+inf], keep order:false"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "union_all",
+      "sql": "SELECT id FROM orders WHERE id<3 UNION ALL SELECT id FROM orders WHERE id>998",
+      "snapshot": {
+        "query_id": "q_2effce0d3e4f0728f09cad806e0ca8689fe9c6d9fdd7efd45d3a7c6a41eb78c7",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "tidb_json",
+        "columns": [
+          "TiDB_JSON"
+        ],
+        "rows": [
+          [
+            "[\n    {\n        \"id\": \"Union_10\",\n        \"estRows\": \"4.00\",\n        \"taskType\": \"root\",\n        \"subOperators\": [\n            {\n                \"id\": \"TableReader_13\",\n                \"estRows\": \"2.00\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"data:TableRangeScan_12\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"TableRangeScan_12\",\n                        \"estRows\": \"2.00\",\n                        \"taskType\": \"cop[tikv]\",\n                        \"accessObject\": \"table:orders\",\n                        \"operatorInfo\": \"range:[-inf,3), keep order:false\"\n                    }\n                ]\n            },\n            {\n                \"id\": \"TableReader_16\",\n                \"estRows\": \"3.00\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"data:TableRangeScan_15\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"TableRangeScan_15\",\n                        \"estRows\": \"3.00\",\n                        \"taskType\": \"cop[tikv]\",\n                        \"accessObject\": \"table:orders\",\n                        \"operatorInfo\": \"range:(998,+inf], keep order:false\"\n                    }\n                ]\n            }\n        ]\n    }\n]\n"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "union_distinct",
+      "sql": "SELECT customer_id FROM orders WHERE id<8 UNION SELECT id FROM customers WHERE id<8",
+      "snapshot": {
+        "query_id": "q_f50c5cb935f62b3960f1a77aedbb239443dc1f25f0f9b626352dfa3085598810",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "row",
+        "columns": [
+          "id",
+          "estRows",
+          "task",
+          "access object",
+          "operator info"
+        ],
+        "rows": [
+          [
+            "HashAgg_11",
+            "8.00",
+            "root",
+            "",
+            "group by:Column#9, funcs:firstrow(Column#9)->Column#9"
+          ],
+          [
+            "└─Union_12",
+            "14.00",
+            "root",
+            "",
+            ""
+          ],
+          [
+            "  ├─TableReader_18",
+            "7.00",
+            "root",
+            "",
+            "data:Projection_14"
+          ],
+          [
+            "  │ └─Projection_14",
+            "7.00",
+            "cop[tikv]",
+            "",
+            "pcc_validation_20261011.orders.customer_id->Column#9"
+          ],
+          [
+            "  │   └─TableRangeScan_17",
+            "7.00",
+            "cop[tikv]",
+            "table:orders",
+            "range:[-inf,8), keep order:false"
+          ],
+          [
+            "  └─TableReader_21",
+            "7.00",
+            "root",
+            "",
+            "data:TableRangeScan_20"
+          ],
+          [
+            "    └─TableRangeScan_20",
+            "7.00",
+            "cop[tikv]",
+            "table:customers",
+            "range:[-inf,8), keep order:false"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "union_distinct",
+      "sql": "SELECT customer_id FROM orders WHERE id<8 UNION SELECT id FROM customers WHERE id<8",
+      "snapshot": {
+        "query_id": "q_f50c5cb935f62b3960f1a77aedbb239443dc1f25f0f9b626352dfa3085598810",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "tidb_json",
+        "columns": [
+          "TiDB_JSON"
+        ],
+        "rows": [
+          [
+            "[\n    {\n        \"id\": \"HashAgg_11\",\n        \"estRows\": \"8.00\",\n        \"taskType\": \"root\",\n        \"operatorInfo\": \"group by:Column#9, funcs:firstrow(Column#9)->Column#9\",\n        \"subOperators\": [\n            {\n                \"id\": \"Union_12\",\n                \"estRows\": \"14.00\",\n                \"taskType\": \"root\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"TableReader_18\",\n                        \"estRows\": \"7.00\",\n                        \"taskType\": \"root\",\n                        \"operatorInfo\": \"data:Projection_14\",\n                        \"subOperators\": [\n                            {\n                                \"id\": \"Projection_14\",\n                                \"estRows\": \"7.00\",\n                                \"taskType\": \"cop[tikv]\",\n                                \"operatorInfo\": \"pcc_validation_20261011.orders.customer_id->Column#9\",\n                                \"subOperators\": [\n                                    {\n                                        \"id\": \"TableRangeScan_17\",\n                                        \"estRows\": \"7.00\",\n                                        \"taskType\": \"cop[tikv]\",\n                                        \"accessObject\": \"table:orders\",\n                                        \"operatorInfo\": \"range:[-inf,8), keep order:false\"\n                                    }\n                                ]\n                            }\n                        ]\n                    },\n                    {\n                        \"id\": \"TableReader_21\",\n                        \"estRows\": \"7.00\",\n                        \"taskType\": \"root\",\n                        \"operatorInfo\": \"data:TableRangeScan_20\",\n                        \"subOperators\": [\n                            {\n                                \"id\": \"TableRangeScan_20\",\n                                \"estRows\": \"7.00\",\n                                \"taskType\": \"cop[tikv]\",\n                                \"accessObject\": \"table:customers\",\n                                \"operatorInfo\": \"range:[-inf,8), keep order:false\"\n                            }\n                        ]\n                    }\n                ]\n            }\n        ]\n    }\n]\n"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "aggregation",
+      "sql": "SELECT status,COUNT(*),SUM(amount) FROM orders GROUP BY status HAVING COUNT(*)>10",
+      "snapshot": {
+        "query_id": "q_8789584f4f6e06fd7d8c135dd0c1fd8f68934f83bdcc29b2c84f5d9dc87b406e",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "row",
+        "columns": [
+          "id",
+          "estRows",
+          "task",
+          "access object",
+          "operator info"
+        ],
+        "rows": [
+          [
+            "Projection_6",
+            "3.20",
+            "root",
+            "",
+            "pcc_validation_20261011.orders.status, Column#6->Column#9, Column#7->Column#10"
+          ],
+          [
+            "└─Selection_7",
+            "3.20",
+            "root",
+            "",
+            "gt(Column#6, 10)"
+          ],
+          [
+            "  └─HashAgg_15",
+            "4.00",
+            "root",
+            "",
+            "group by:pcc_validation_20261011.orders.status, funcs:count(Column#11)->Column#6, funcs:sum(Column#12)->Column#7, funcs:firstrow(pcc_validation_20261011.orders.status)->pcc_validation_20261011.orders.status"
+          ],
+          [
+            "    └─IndexReader_16",
+            "4.00",
+            "root",
+            "",
+            "index:HashAgg_8"
+          ],
+          [
+            "      └─HashAgg_8",
+            "4.00",
+            "cop[tikv]",
+            "",
+            "group by:pcc_validation_20261011.orders.status, funcs:count(1)->Column#11, funcs:sum(pcc_validation_20261011.orders.amount)->Column#12"
+          ],
+          [
+            "        └─IndexFullScan_14",
+            "1000.00",
+            "cop[tikv]",
+            "table:orders, index:idx_status_amount(status, amount)",
+            "keep order:false"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "aggregation",
+      "sql": "SELECT status,COUNT(*),SUM(amount) FROM orders GROUP BY status HAVING COUNT(*)>10",
+      "snapshot": {
+        "query_id": "q_8789584f4f6e06fd7d8c135dd0c1fd8f68934f83bdcc29b2c84f5d9dc87b406e",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "tidb_json",
+        "columns": [
+          "TiDB_JSON"
+        ],
+        "rows": [
+          [
+            "[\n    {\n        \"id\": \"Projection_6\",\n        \"estRows\": \"3.20\",\n        \"taskType\": \"root\",\n        \"operatorInfo\": \"pcc_validation_20261011.orders.status, Column#6->Column#9, Column#7->Column#10\",\n        \"subOperators\": [\n            {\n                \"id\": \"Selection_7\",\n                \"estRows\": \"3.20\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"gt(Column#6, 10)\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"HashAgg_15\",\n                        \"estRows\": \"4.00\",\n                        \"taskType\": \"root\",\n                        \"operatorInfo\": \"group by:pcc_validation_20261011.orders.status, funcs:count(Column#11)->Column#6, funcs:sum(Column#12)->Column#7, funcs:firstrow(pcc_validation_20261011.orders.status)->pcc_validation_20261011.orders.status\",\n                        \"subOperators\": [\n                            {\n                                \"id\": \"IndexReader_16\",\n                                \"estRows\": \"4.00\",\n                                \"taskType\": \"root\",\n                                \"operatorInfo\": \"index:HashAgg_8\",\n                                \"subOperators\": [\n                                    {\n                                        \"id\": \"HashAgg_8\",\n                                        \"estRows\": \"4.00\",\n                                        \"taskType\": \"cop[tikv]\",\n                                        \"operatorInfo\": \"group by:pcc_validation_20261011.orders.status, funcs:count(1)->Column#11, funcs:sum(pcc_validation_20261011.orders.amount)->Column#12\",\n                                        \"subOperators\": [\n                                            {\n                                                \"id\": \"IndexFullScan_14\",\n                                                \"estRows\": \"1000.00\",\n                                                \"taskType\": \"cop[tikv]\",\n                                                \"accessObject\": \"table:orders, index:idx_status_amount(status, amount)\",\n                                                \"operatorInfo\": \"keep order:false\"\n                                            }\n                                        ]\n                                    }\n                                ]\n                            }\n                        ]\n                    }\n                ]\n            }\n        ]\n    }\n]\n"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "window",
+      "sql": "SELECT id,ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY amount DESC) AS rn FROM orders WHERE id<20",
+      "snapshot": {
+        "query_id": "q_a48f94616026bd9876dd9288337e2ec5037558e13944ab5c325fca6405ca2760",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "row",
+        "columns": [
+          "id",
+          "estRows",
+          "task",
+          "access object",
+          "operator info"
+        ],
+        "rows": [
+          [
+            "Projection_8",
+            "19.00",
+            "root",
+            "",
+            "pcc_validation_20261011.orders.id, Column#7->Column#9"
+          ],
+          [
+            "└─Shuffle_15",
+            "19.00",
+            "root",
+            "",
+            "execution info: concurrency:1, data sources:[TableReader_13]"
+          ],
+          [
+            "  └─Window_11",
+            "19.00",
+            "root",
+            "",
+            "row_number()->Column#7 over(partition by pcc_validation_20261011.orders.customer_id order by pcc_validation_20261011.orders.amount desc rows between current row and current row)"
+          ],
+          [
+            "    └─Sort_14",
+            "19.00",
+            "root",
+            "",
+            "pcc_validation_20261011.orders.customer_id, pcc_validation_20261011.orders.amount:desc"
+          ],
+          [
+            "      └─ShuffleReceiver_16",
+            "19.00",
+            "root",
+            "",
+            ""
+          ],
+          [
+            "        └─TableReader_13",
+            "19.00",
+            "root",
+            "",
+            "data:TableRangeScan_12"
+          ],
+          [
+            "          └─TableRangeScan_12",
+            "19.00",
+            "cop[tikv]",
+            "table:orders",
+            "range:[-inf,20), keep order:false"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "window",
+      "sql": "SELECT id,ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY amount DESC) AS rn FROM orders WHERE id<20",
+      "snapshot": {
+        "query_id": "q_a48f94616026bd9876dd9288337e2ec5037558e13944ab5c325fca6405ca2760",
+        "side": "old",
+        "version": "v7.1.9-0.3",
+        "format": "tidb_json",
+        "columns": [
+          "TiDB_JSON"
+        ],
+        "rows": [
+          [
+            "[\n    {\n        \"id\": \"Projection_8\",\n        \"estRows\": \"19.00\",\n        \"taskType\": \"root\",\n        \"operatorInfo\": \"pcc_validation_20261011.orders.id, Column#7->Column#9\",\n        \"subOperators\": [\n            {\n                \"id\": \"Shuffle_15\",\n                \"estRows\": \"19.00\",\n                \"taskType\": \"root\",\n                \"operatorInfo\": \"execution info: concurrency:1, data sources:[TableReader_13]\",\n                \"subOperators\": [\n                    {\n                        \"id\": \"Window_11\",\n                        \"estRows\": \"19.00\",\n                        \"taskType\": \"root\",\n                        \"operatorInfo\": \"row_number()->Column#7 over(partition by pcc_validation_20261011.orders.customer_id order by pcc_validation_20261011.orders.amount desc rows between current row and current row)\",\n                        \"subOperators\": [\n                            {\n                                \"id\": \"Sort_14\",\n                                \"estRows\": \"19.00\",\n                                \"taskType\": \"root\",\n                                \"operatorInfo\": \"pcc_validation_20261011.orders.customer_id, pcc_validation_20261011.orders.amount:desc\",\n                                \"subOperators\": [\n                                    {\n                                        \"id\": \"ShuffleReceiver_16\",\n                                        \"estRows\": \"19.00\",\n                                        \"taskType\": \"root\",\n                                        \"subOperators\": [\n                                            {\n                                                \"id\": \"TableReader_13\",\n                                                \"estRows\": \"19.00\",\n                                                \"taskType\": \"root\",\n                                                \"operatorInfo\": \"data:TableRangeScan_12\",\n                                                \"subOperators\": [\n                                                    {\n                                                        \"id\": \"TableRangeScan_12\",\n                                                        \"estRows\": \"19.00\",\n                                                        \"taskType\": \"cop[tikv]\",\n                                                        \"accessObject\": \"table:orders\",\n                                                        \"operatorInfo\": \"range:[-inf,20), keep order:false\"\n                                                    }\n                                                ]\n                                            }\n                                        ]\n                                    }\n                                ]\n                            }\n                        ]\n                    }\n                ]\n            }\n        ]\n    }\n]\n"
+          ]
+        ]
+      }
+    }
+  ]
+}

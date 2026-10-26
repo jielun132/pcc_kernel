@@ -1,0 +1,1 @@
+"""Integrity checked, versioned artifacts."""

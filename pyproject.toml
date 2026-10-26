@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcc-tool"
+version = "0.1.2"
+description = "Offline-first TiDB plan change capture and comparison core"
+requires-python = ">=3.11,<3.12"
+dependencies = ["PyMySQL==1.1.2", "sqlglot==28.0.0"]
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+keywords = ["tidb", "sql", "explain", "query-plan", "database-upgrade"]
+
+[project.urls]
+Homepage = "https://github.com/jielun132/pcc_kernel"
+Repository = "https://github.com/jielun132/pcc_kernel"
+Issues = "https://github.com/jielun132/pcc_kernel/issues"
+
+[project.scripts]
+pcc = "pcc_tool.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pcc_tool = ["schemas/*.json"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["integration: requires explicitly supplied isolated TiDB environments"]

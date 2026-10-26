@@ -1,0 +1,8 @@
+include README.md LICENSE NOTICE THIRD_PARTY_NOTICES.md CONTRIBUTING.md SECURITY.md requirements.lock requirements-dev.lock
+recursive-include docs *.md
+exclude docs/test-report-*.md docs/sql-coverage-report-*.md
+exclude plan.md AGENTS.md
+recursive-include examples *.json *.jsonl *.html *.csv
+recursive-include tests *.py *.md *.sql *.json *.txt
+recursive-include scripts *.py
+recursive-include packaging *.py

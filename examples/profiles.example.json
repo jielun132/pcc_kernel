@@ -1,0 +1,22 @@
+{
+  "profiles": {
+    "prod": {
+      "host": "source-tidb.example.invalid", "port": 4000, "user": "pcc_reader",
+      "password_env": "PCC_PROD_PASSWORD", "status_url": "https://source-tidb.example.invalid:10080",
+      "source_cluster": "production", "timezone": "Asia/Shanghai", "role": "source",
+      "tls": {"ca": "/path/to/ca.pem"}, "status_tls": {"ca": "/path/to/ca.pem"}
+    },
+    "old": {
+      "host": "old-tidb.example.invalid", "port": 4000, "user": "pcc_reader",
+      "status_url": "http://old-tidb.example.invalid:10080",
+      "password_env": "PCC_OLD_PASSWORD", "expected_version": "v6.5.12", "role": "test",
+      "session": {"time_zone": "+00:00", "sql_mode": "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"}
+    },
+    "new": {
+      "host": "new-tidb.example.invalid", "port": 4000, "user": "pcc_reader",
+      "status_url": "http://new-tidb.example.invalid:10080",
+      "password_env": "PCC_NEW_PASSWORD", "expected_version": "v8.5.4", "role": "test",
+      "session": {"time_zone": "+00:00", "sql_mode": "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"}
+    }
+  }
+}

@@ -1,0 +1,7 @@
+﻿query_id,schema,compare_status,sql_text,event,field,old,new,requires_review
+q_abaeeb6d08a48b6bcb701ceb606525e0b6c131b73a0fc5f36696567f045d2ec8,app,changed,SELECT * FROM app.orders WHERE id BETWEEN 10 AND 20,operator_changed,operator,"""TableFullScan""","""TableRangeScan""",False
+q_abaeeb6d08a48b6bcb701ceb606525e0b6c131b73a0fc5f36696567f045d2ec8,app,changed,SELECT * FROM app.orders WHERE id BETWEEN 10 AND 20,access_path_changed,access,"{""object"":""table:orders"",""operator"":""TableFullScan""}","{""object"":""table:orders"",""operator"":""TableRangeScan""}",False
+q_abaeeb6d08a48b6bcb701ceb606525e0b6c131b73a0fc5f36696567f045d2ec8,app,changed,SELECT * FROM app.orders WHERE id BETWEEN 10 AND 20,predicate_or_attribute_changed,operator_info,"""keep order:false""","""range:[10,20], keep order:false""",False
+q_abaeeb6d08a48b6bcb701ceb606525e0b6c131b73a0fc5f36696567f045d2ec8,app,changed,SELECT * FROM app.orders WHERE id BETWEEN 10 AND 20,estimate_changed,estRows,"""1000""","""11""",False
+q_de23eb0a1ab18f7b6a4c6744859705dd26e82346b376b70f14d32dfe21bbe076,app,same,SELECT * FROM app.orders WHERE id=10,,,,,False
+unresolved_a89a48b9dd618585a3eedfc08fc60614037c85d4ab63de78ee412d09954a8a11,app,not_run,,,,,,False

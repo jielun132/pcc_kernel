@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:pcc:contracts:1",
+  "title": "PCC Core contract version 1",
+  "$defs": {
+    "decimal": {"type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "versions": {
+      "type": "object",
+      "required": ["contract_version", "ir_version", "normalizer_version", "matcher_version", "diff_version", "guard_version"],
+      "properties": {"contract_version": {"const": "1"}},
+      "additionalProperties": {"type": "string"}
+    },
+    "issue": {
+      "type": "object", "required": ["code"],
+      "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "query_id": {"type": ["string", "null"]},
+                     "severity": {"enum": ["warning", "error"]}}
+    },
+    "QueryCase": {
+      "type": "object", "additionalProperties": false,
+      "required": ["query_id", "schema", "sql_text", "sql_hash", "executable_status", "sample_origins", "context", "dependencies"],
+      "properties": {
+        "query_id": {"type": "string", "pattern": "^(q_|unresolved_)[0-9a-f]{64}$"},
+        "schema": {"type": "string"}, "sql_text": {"type": ["string", "null"]},
+        "sql_hash": {"anyOf": [{"$ref": "#/$defs/hash"}, {"type": "null"}]},
+        "source_digest": {"type": "string"}, "source_cluster": {"type": "string"},
+        "statement_type": {"type": "string"}, "executable_status": {"enum": ["ok", "needs_sample", "unsupported"]},
+        "sample_origins": {"type": "array", "items": {"type": "object"}},
+        "source_plan_refs": {"type": "array", "items": {"type": "object"}},
+        "context": {"type": "object"}, "metrics": {"type": "object"},
+        "parameters": {"type": ["array", "null"], "items": {"type": "object", "required": ["type", "value"], "additionalProperties": false,
+          "properties": {"type": {"enum": ["null", "bool", "int", "uint", "decimal", "double", "string", "bytes", "date", "datetime", "time", "json"]}, "value": {"type": ["string", "boolean", "null"]}}}},
+        "dependencies": {"type": "array", "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "string"}}},
+        "issues": {"type": "array", "items": {"$ref": "#/$defs/issue"}}
+      }
+    },
+    "PlanSnapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["query_id", "side", "version", "format", "columns", "rows", "capture_status"],
+      "properties": {
+        "query_id": {"type": "string"}, "side": {"enum": ["old", "new", "probe"]}, "version": {"type": "string"},
+        "context": {"type": "object"}, "format": {"enum": ["row", "tidb_json"]}, "columns": {"type": "array", "items": {"type": "string"}},
+        "rows": {"type": "array"}, "warnings": {"type": "array"}, "captured_at": {"type": "string"},
+        "capture_status": {"enum": ["ok", "failed", "skipped", "needs_sample"]},
+        "issues": {"type": "array", "items": {"$ref": "#/$defs/issue"}}, "attempts": {"type": "array"},
+        "cancellation": {"enum": [null, "pending", "confirmed", "unknown", "timeout_only", "query_finished"]}
+      }
+    },
+    "PlanNode": {
+      "type": "object", "required": ["node_id", "operator", "children", "unknown", "evidence"],
+      "properties": {
+        "node_id": {"type": "string"}, "operator": {"type": "string"}, "task": {"type": "string"},
+        "engine": {"type": "string"}, "access": {"type": "string"}, "attributes": {"type": "string"}, "role": {"type": "string"},
+        "estimate": {"anyOf": [{"$ref": "#/$defs/decimal"}, {"type": "null"}]},
+        "children": {"type": "array", "items": {"$ref": "#/$defs/PlanNode"}}, "unknown": {"type": "object"}, "evidence": {"type": "object"}
+      }
+    },
+    "PlanIR": {
+      "type": "object", "required": ["query_id", "roots", "parse_status", "versions"],
+      "properties": {
+        "query_id": {"type": "string"}, "roots": {"type": "array", "items": {"$ref": "#/$defs/PlanNode"}},
+        "parse_status": {"enum": ["ok", "partial", "failed"]}, "issues": {"type": "array"}, "versions": {"$ref": "#/$defs/versions"}
+      }
+    },
+    "DiffEvent": {
+      "type": "object", "required": ["query_id", "type", "old_node", "new_node", "field", "old", "new", "evidence", "confidence", "requires_review"],
+      "properties": {
+        "query_id": {"type": "string"},
+        "type": {"enum": ["node_added", "node_removed", "operator_changed", "access_path_changed", "join_changed", "child_order_changed",
+                          "task_or_engine_changed", "predicate_or_attribute_changed", "estimate_changed", "unknown_field_changed", "ambiguous_match"]},
+        "old_node": {"type": ["string", "null"]}, "new_node": {"type": ["string", "null"]}, "field": {"type": "string"},
+        "evidence": {"type": "object"}, "confidence": {"enum": ["high", "medium", "low"]}, "requires_review": {"type": "boolean"}
+      }
+    },
+    "ComparisonItem": {
+      "type": "object", "required": ["query_id", "compare_status", "old", "new", "needs_sample", "issues"],
+      "properties": {"query_id": {"type": "string"}, "compare_status": {"enum": ["same", "changed", "incomparable", "not_run"]},
+                     "needs_sample": {"type": "boolean"}, "requires_review": {"type": "boolean"}, "issues": {"type": "array"}}
+    },
+    "Manifest": {
+      "type": "object", "required": ["kind", "contract_version", "files", "fingerprint", "run_status"],
+      "properties": {
+        "kind": {"enum": ["CaptureBundle", "ComparisonResult", "Preparation"]}, "contract_version": {"const": "1"},
+        "files": {"type": "object", "additionalProperties": {"$ref": "#/$defs/hash"}}, "fingerprint": {"$ref": "#/$defs/hash"},
+        "run_status": {"enum": ["completed", "partial", "blocked", "interrupted"]}
+      }
+    },
+    "ProgressEvent": {
+      "type": "object", "required": ["contract_version", "event"],
+      "properties": {"contract_version": {"const": "1"}, "event": {"type": "string"}, "sequence": {"type": "string"}, "time": {"type": "string"}}
+    }
+  },
+  "oneOf": [{"$ref": "#/$defs/QueryCase"}, {"$ref": "#/$defs/PlanSnapshot"}, {"$ref": "#/$defs/PlanIR"},
+            {"$ref": "#/$defs/DiffEvent"}, {"$ref": "#/$defs/ComparisonItem"}, {"$ref": "#/$defs/Manifest"}, {"$ref": "#/$defs/ProgressEvent"}]
+}
