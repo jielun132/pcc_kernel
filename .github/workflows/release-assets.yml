@@ -17,7 +17,7 @@ jobs:
           mkdir -p dist
           docker run --rm \
             -v "$PWD:/source:ro" -v "$PWD/dist:/output" \
-            rockylinux:8.10 bash -euc '
+            rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6 bash -euc '
               dnf install -y python3.11 python3.11-devel python3.11-pip binutils
               cp -a /source /work
               cd /work
