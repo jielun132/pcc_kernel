@@ -56,7 +56,7 @@ def main():
     shutil.copytree(ROOT / "examples", target / "examples")
     shutil.copy2(ROOT / "README.md", target / "README.md")
     shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", target / "THIRD_PARTY_NOTICES.md")
-    for name in ("LICENSE", "NOTICE", "CONTRIBUTING.md", "SECURITY.md"):
+    for name in ("LICENSE", "NOTICE", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md"):
         shutil.copy2(ROOT / name, target / name)
     shutil.copy2(ROOT / "requirements.lock", target / "requirements.lock")
     shutil.copytree(output / "wheels", target / "sdk")
@@ -78,7 +78,9 @@ def main():
         for index, file in enumerate(files):
             shutil.copy2(dist.locate_file(file), licenses / f"{name}-{index}-{Path(file).name}")
     python_license = next((p for p in [Path(sys.base_prefix) / "LICENSE.txt", Path(sys.base_prefix) / "LICENSE",
-                                      Path(sys.base_prefix) / "lib/python3.11/LICENSE.txt"] if p.exists()), None)
+                                      Path(sys.base_prefix) / "lib/python3.11/LICENSE.txt",
+                                      Path("/usr/share/licenses/python3.11/LICENSE"),
+                                      Path("/usr/share/licenses/python3.11-libs/LICENSE")] if p.exists()), None)
     if python_license is None:
         raise RuntimeError("CPython license is missing; include the runtime distribution license before release")
     shutil.copy2(python_license, licenses / "CPython-LICENSE.txt")

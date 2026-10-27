@@ -1,0 +1,30 @@
+{
+  "profiles": {
+    "prod": {
+      "host": "prod-tidb.example.invalid", "port": 4000, "user": "root",
+      "status_url": "http://prod-tidb.example.invalid:10080",
+      "password_env": "PCC_DB_PASSWORD", "source_cluster": "pcc-demo",
+      "timezone": "Asia/Shanghai", "role": "source"
+    },
+    "old": {
+      "host": "old-tidb.example.invalid", "port": 4000, "user": "root",
+      "status_url": "http://old-tidb.example.invalid:10080",
+      "password_env": "PCC_DB_PASSWORD", "role": "test",
+      "session": {
+        "time_zone": "+08:00", "sql_mode": "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION",
+        "tidb_isolation_read_engines": "tikv", "tidb_allow_mpp": "OFF", "tidb_enforce_mpp": "OFF",
+        "tidb_stats_load_sync_wait": 10000
+      }
+    },
+    "new": {
+      "host": "new-tidb.example.invalid", "port": 4000, "user": "root",
+      "status_url": "http://new-tidb.example.invalid:10080",
+      "password_env": "PCC_DB_PASSWORD", "role": "test",
+      "session": {
+        "time_zone": "+08:00", "sql_mode": "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION",
+        "tidb_isolation_read_engines": "tikv", "tidb_allow_mpp": "OFF", "tidb_enforce_mpp": "OFF",
+        "tidb_stats_load_sync_wait": 10000
+      }
+    }
+  }
+}

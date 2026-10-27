@@ -1,0 +1,47 @@
+name: Build release assets
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build on Rocky Linux 8 with glibc 2.28
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -v "$PWD:/source:ro" -v "$PWD/dist:/output" \
+            rockylinux:8.10 bash -euc '
+              dnf install -y python3.11 python3.11-devel python3.11-pip binutils
+              cp -a /source /work
+              cd /work
+              python3.11 -m venv /tmp/pcc-build
+              export PATH="/tmp/pcc-build/bin:$PATH"
+              python -m pip install -r requirements-dev.lock
+              python -m pip install --no-deps -e .
+              python scripts/build_linux.py --arch x86_64 --distro rocky:8.10 --glibc 2.28 --out /output/build
+              version=$(python -c "from pcc_tool import __version__; print(__version__)")
+              binary="/output/build/pcc-core-$version-linux-x86_64/pcc"
+              test "$(env -i PATH=/usr/bin:/bin LANG=C.UTF-8 "$binary" --version)" = "$version"
+              code=0
+              env -i PATH=/usr/bin:/bin LANG=C.UTF-8 "$binary" diff \
+                --result-dir examples/demo-result --out /output/offline-smoke || code=$?
+              test "$code" -eq 3
+              test -s /output/offline-smoke/report.html
+            '
+      - name: Upload native package, SDK and source distribution
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pcc-linux-x86_64
+          if-no-files-found: error
+          path: |
+            dist/build/pcc-core-*-linux-x86_64.tar.gz
+            dist/build/pcc-core-*-linux-x86_64.tar.gz.sha256
+            dist/build/wheels/*.whl
+            dist/build/wheels/*.tar.gz

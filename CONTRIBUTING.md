@@ -35,4 +35,8 @@ python3.11 -m venv .venv
 
 wheel / sdist 可在开发环境构建；原生 Linux 包必须在声明的发行版、CPU 与 glibc 基线上构建并验证，流程见 [distribution.md](docs/distribution.md)。构建完成不自动等于兼容性认证。
 
+每次发布都更新 `pyproject.toml`、`src/pcc_tool/__init__.py` 中的版本号，并在 [CHANGELOG.md](CHANGELOG.md) 写明改动、验证结果和仍存在的限制。README 的版本号及下载地址一并更新。
+
+通过 PR 合并且 CI 通过后，在 Actions 手动运行 **Build release assets**。它从当前提交构建 Rocky Linux 8.10 / x86_64 / glibc 2.28 原生包并执行离线冒烟验证。构建通过后，为这个已验证的提交创建 `vX.Y.Z` 标签和 GitHub Release，上传构建产物及校验文件，填写对应版本的更新说明。保留每个历史标签和 Release，不覆盖旧版资产；从 [Releases](https://github.com/jielun132/pcc_kernel/releases) 查看所有版本。
+
 项目采用 [Apache-2.0](LICENSE)。提交贡献时，请确保有权按该许可证贡献相应内容，并保留第三方声明。
