@@ -1,155 +1,108 @@
 # PCC Core
 
-[![CI](https://github.com/jielun132/pcc_kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/jielun132/pcc_kernel/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)
+**把同一批 SQL 放到升级前、升级后的 TiDB 中，比较执行计划，并生成 HTML 报告。**
 
-**面向 TiDB 升级的 SQL 采集、材料导出和执行计划比较工具。**
+当前版本：**0.1.3** · [下载与所有版本](https://github.com/jielun132/pcc_kernel/releases) · [更新记录](CHANGELOG.md)
 
-Offline-first TiDB execution plan capture and comparison, with a shared Python CLI and SDK.
+下面按一个完整 Demo 走四步。准备三套相互独立的 TiDB：`prod` 模拟生产环境，`old` 模拟升级前，`new` 模拟升级后。PCC 只对待比较 SQL 执行普通 `EXPLAIN`，不会执行业务 DML。
 
-PCC Core 从 Statement Summary 或给定 SQL 清单导出 SQL、表结构、统计信息和上下文，在两套测试环境获取普通 `EXPLAIN`，输出可离线阅读的 HTML、JSONL 和 CSV 报告。CLI `pcc` 与 SDK `pcc_tool.api` 共用核心，可独立使用，也可接入后续平台。
+## 1. 部署工具，填好连接信息
 
-当前版本 **0.1.2，处于早期迭代阶段**。已完成三套集群的实测，但尚未全部通过：分区统计完整回放、TiDB 6.5 的部分 Prepared SQL、二进制参数对照仍有明确限制。请先阅读 [验证结果与已知问题](docs/validation.md)。本项目是独立实现，不依赖旧 Go PCC。
-
-## 能做什么
-
-- **筛选 SQL**：按执行次数、总延迟、加权平均延迟、估算总扫描键数、加权平均扫描键数分别取 Top N，再取并集。
-- **导出材料**：保留原 SQL、Hint、显式参数、表/视图依赖、原始统计 JSON 和上下文，生成带校验和的 CaptureBundle。
-- **持续采集**：可选 `collect --watch` 写入文件队列，重启后继续采集，再按业务窗口导出。
-- **比较计划**：采集 row / tidb_json，统一解析、匹配节点并保留已识别差异；未知语义、缺样例和失败单独列出。
-- **离线重算**：`diff` 从归档的原始计划重新比较，不需要数据库、配置文件或凭据。
-- **开发集成**：Python SDK、JSONL 事件、取消及带指纹校验的断点恢复。
-
-PCC 不执行业务 SQL 或 `EXPLAIN ANALYZE`。`prepare` 生成供 DBA 审核的导入材料，由 DBA 人工执行 DDL / LOAD STATS；工具不自动导入、恢复业务数据、下发 Binding 或部署数据库。计划差异是事实证据，不能直接解释成性能回退百分比。
-
-## 快速开始：先看离线报告
-
-要求 **CPython 3.11**。目前从源码安装；不要将包名理解为已经发布到 PyPI。
+在能连接三套 TiDB 的 **Linux x86_64** 机器上执行，使用 Bash。原生包自带 Python；运行机需要 glibc 2.28 或以上，导入步骤另需 MySQL 8 客户端。
 
 ```bash
-git clone git@github.com:jielun132/pcc_kernel.git
-cd pcc_kernel
-python3.11 -m venv .venv
-.venv/bin/python -m pip install -r requirements.lock
-.venv/bin/python -m pip install --no-deps -e .
-.venv/bin/pcc doctor
-
-# 使用合成数据，经过实际解析、比较及报告生成流程；无需 TiDB。
-.venv/bin/python scripts/make_demo.py --out demo-output/example
+curl -fLO https://github.com/jielun132/pcc_kernel/releases/download/v0.1.3/pcc-core-0.1.3-linux-x86_64.tar.gz
+tar -xzf pcc-core-0.1.3-linux-x86_64.tar.gz
+cd pcc-core-0.1.3-linux-x86_64
+./pcc --version
+cp examples/profiles.demo.json profiles.json
+vi profiles.json
 ```
 
-用浏览器打开 `demo-output/example/report.html`。演示有一条计划变化、一条相同计划和一条缺 SQL 样例，便于查看报告如何区分差异与覆盖不足；它不是集群兼容性测试。
+配置里只有三组连接，填入自己的 `host`、`port`、`user`、`status_url`。`status_url` 是对应 TiDB 节点的 HTTP Status 地址，常用端口是 `10080`。
 
-重新计算已归档的计划：
+| 配置名 | 对应环境 | 用途 |
+|---|---|---|
+| `prod` | 模拟生产 | 跑演示 SQL，导出材料 |
+| `old` | 升级前的临时环境 | 导入材料，获取旧计划 |
+| `new` | 升级后的临时环境 | 导入材料，获取新计划 |
+
+本例使用**无 TLS、三套环境相同的数据库密码**。下面所有 `mysql` 命令中的示例主机、端口、用户，也要替换成配置中对应的值。不同密码或 TLS 配置见 [操作说明](docs/operations.md)。
 
 ```bash
-.venv/bin/pcc diff --result-dir demo-output/example --out demo-output/recomputed
+read -r -s -p '请输入 TiDB 数据库密码：' PCC_DB_PASSWORD
+echo
+export PCC_DB_PASSWORD
+export MYSQL_PWD="$PCC_DB_PASSWORD"
+export TZ=Asia/Shanghai
 ```
 
-这个演示保留了缺样例，`diff` 返回 **3** 是预期的部分覆盖结果。输出目录不可覆盖，重跑时请使用新目录。
+## 2. 在 prod 跑几条 SQL，再按时间导出
 
-## 连接 TiDB 的完整流程
-
-1. 复制 [配置示例](examples/profiles.example.json) 为私有 `profiles.json`，填写源库和两套隔离测试环境。
-2. 通过配置中的 `password_env` 引用已有环境变量；不要在 JSON、命令参数或 Git 仓库中保存密码。
-3. `old` / `new` 明确配置 `role: "test"`，使用不同、固定的 TiDB SQL 端点。`expected_version` 填写现场实际 Release Version，不能混用 Enterprise Core Version。
-4. SQL 与 Status 地址需要验证同源；TLS、权限和统计加载要求见 [操作说明](docs/operations.md)。
-
-以下示例假设 `pcc` 已在 PATH 中；源码安装也可使用 `.venv/bin/pcc`。
+下面新建一个专用演示库，写入 3 个客户、320 条订单，再执行包含聚合、Join、Hint 的 6 条查询。`examples/demo.sql` 只操作选定的演示库。
 
 ```bash
-# 时间窗口仅是示例，请换成源端实际可见的窗口。
-pcc --config profiles.json export --source prod --from-summary \
-  --begin '2026-10-08T09:00:00+08:00' --end '2026-10-08T11:00:00+08:00' \
-  --top-n 20 --out bundle/run-001
-pcc --config profiles.json prepare --bundle bundle/run-001 \
-  --targets old,new --out preparation/run-001
+DEMO_DB="pcc_demo_$(date +%Y%m%d_%H%M%S)"
+DEMO_DIR="$PWD/demo-output/$DEMO_DB"
 
-# DBA 审核后，将同一份表结构和统计信息人工导入两端。
-# 已有对象先核验，跨机器移动材料时审核 LOAD STATS 文件路径。
-pcc --config profiles.json doctor --bundle bundle/run-001 --targets old,new
-pcc --config profiles.json compare --bundle bundle/run-001 \
-  --old old --new new --out results/run-001
-pcc diff --result-dir results/run-001 --out results/offline-001
+mysql -hprod-tidb.example.invalid -P4000 -uroot --ssl-mode=DISABLED \
+  -e "CREATE DATABASE \`$DEMO_DB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;"
+
+PCC_BEGIN=$(date -Is)
+mysql -hprod-tidb.example.invalid -P4000 -uroot --ssl-mode=DISABLED \
+  "$DEMO_DB" < examples/demo.sql
+sleep 1
+PCC_END=$(date -Is)
+
+./pcc --config profiles.json export --source prod --from-summary \
+  --begin "$PCC_BEGIN" --end "$PCC_END" --schemas "$DEMO_DB" \
+  --statement-types select --top-n 10 --out "$DEMO_DIR/bundle"
 ```
 
-比较结果包括 `report.html`、`summary.json`、原始计划、IR、差异、问题及 CSV。结果含 SQL、参数和统计信息，应按业务数据管理，不应直接提交到公开仓库。
+`PCC_BEGIN`、`PCC_END` 是本次演示的开始、结束时间。比较已有业务 SQL 时，跳过造数，改为自己的库名和时间范围，例如 `2026-10-27T09:00:00+08:00` 到 `2026-10-27T10:00:00+08:00`；该时间段需要仍有 Statement Summary 记录。
 
-| 退出码 | 含义 |
-|---|---|
-| `0` | 完整比较，无差异 |
-| `1` | 完整比较，有差异；属于正常业务结果 |
-| `2` | 配置、契约或整体前置条件失败 |
-| `3` | 部分失败或覆盖不足，优先于差异状态 |
-| `4` | 运行中断 |
+`--top-n 10` 默认按**执行次数、总耗时、平均耗时、估算总扫描 Key 数、平均扫描 Key 数**各取前 10 个 SQL 摘要，再合并去重。SQL 及其依赖的表结构、统计信息保存到 `bundle`。表结构和统计信息取导出时的当前状态。
 
-## Prepared SQL、Hint 和长 SQL
-
-JSONL 输入可携带完整模板和明确的参数样例：
-
-```json
-{"schema":"app","sql_text":"SELECT /*+ USE_INDEX(o,PRIMARY) */ * FROM orders o WHERE id=?","parameters":[{"type":"int","value":"7"}]}
-```
-
-PCC 保留原模板与 Hint，将 `EXPLAIN 原模板` 做成服务端 Prepared Statement，通过类型化参数执行 EXPLAIN；不会把问号直接替换成字符串。同一模板的不同参数需要分别提供一行。
-
-支持 `int`、`uint`、`decimal`、`double`、`string`、`bytes`、`date`、`datetime`、`time`、`json`、`bool`、`null`。除 bool / null 外，值使用 JSON 字符串；bytes 为十六进制。具体约束见 [参数与输入契约](docs/architecture.md#sql-与参数)。
-
-这条路径重新优化指定参数下的 SQL，**不复现 Prepared Plan Cache 命中，也不模拟所有应用驱动的二进制编码**。应用发送 JSON 文本时应使用 `string`；`json` 表示 SQL JSON 类型。仅有归一化 digest、缺参数或截断文本时会要求补充样例，不猜测参数。
-
-实测包含 Hint、CTE、Join、窗口函数、DML、约 1 MiB SQL、20,000 项 IN、128 分支 UNION ALL、256 参数及长参数传输。**6.5.3 / 6.5.12 的 `PREPARE EXPLAIN ... IN (?)` 仍会失败**，不能据此声称所有 Prepared SQL 都已支持。INSERT / REPLACE 需显式启用 `--statement-types select,update,delete,insert,replace`。
-
-## 持续采集与时间窗口
+## 3. 把同一份结构和统计信息导入 old、new
 
 ```bash
-pcc --config profiles.json collect --source prod --watch \
-  --interval-seconds 300 --out spool/prod
-pcc --config profiles.json export --source prod --spool spool/prod \
-  --begin '2026-10-08T09:00:00+08:00' --end '2026-10-08T11:00:00+08:00' \
-  --out bundle/history
+./pcc --config profiles.json prepare --bundle "$DEMO_DIR/bundle" \
+  --targets old,new --out "$DEMO_DIR/prepared"
+
+mysql -hold-tidb.example.invalid -P4000 -uroot --ssl-mode=DISABLED --local-infile=1 \
+  < "$DEMO_DIR/prepared/old/import_commands.sql"
+mysql -hnew-tidb.example.invalid -P4000 -uroot --ssl-mode=DISABLED --local-infile=1 \
+  < "$DEMO_DIR/prepared/new/import_commands.sql"
+
+sleep 5
 ```
 
-这是 PCC 自身的文件持久化，不要求启用 TiDB 原生 Summary 持久化。时间筛选采用 `[begin,end)` 与 Summary 原始窗口相交的累计值，不是精确分钟级流量，不按重叠时长摊分。重复累计快照不会直接相加；缺样例仍计入完整比较率分母。
+`prepare` 只生成导入脚本；后面的 `mysql` 才真正导入。`--targets old,new` 区分两个导入目标，材料共用一份，**不按版本转换格式**。
 
-`export` 的 `--from-summary`、`--spool`、`--repository`、`--legacy-package`、`--sql-file` 互斥。历史 SQL 与当前表结构/统计信息的时间可能不同；完全离线导出需用 `--dependencies-bundle` 提供已有依赖。旧格式及窗口口径见 [架构与契约](docs/architecture.md)。
+这里不复制业务数据，目标表为空是正常的，**不要在目标环境重新执行 ANALYZE**。`sleep 5` 只是给统计加载留一点时间，不保证加载完成；下一步仍会检查统计信息。
 
-## Python SDK
+## 4. 比较执行计划，打开报告
 
-```python
-from threading import Event
-from pcc_tool.api import compare, diff
-from pcc_tool.capture.connection import load_profiles
-from pcc_tool.models import CompareRequest, DiffRequest
-
-result = compare(
-    CompareRequest(bundle="bundle/run-001", old="old", new="new", out="results/run-001"),
-    profiles=load_profiles("profiles.json"),
-    on_event=print,
-    cancel=Event(),
-)
-print(result.summary, result.exit_code)
-offline = diff(DiffRequest(result_dir="results/run-001", out="results/offline-001"))
+```bash
+./pcc --config profiles.json compare --bundle "$DEMO_DIR/bundle" \
+  --old old --new new --out "$DEMO_DIR/compare" --stats-retries 5
+echo "PCC 返回码：$?"
+echo "报告位置：$DEMO_DIR/compare/report.html"
+unset PCC_DB_PASSWORD MYSQL_PWD
 ```
 
-模块导入不联网。平台可调用 SDK 或使用 argv 列表启动 CLI；`--events jsonl` 将事件写入 stdout，诊断写入 stderr。取消、恢复和上下文核验见 [操作说明](docs/operations.md)。
+把 `report.html` 下载到电脑，用浏览器打开：
 
-## 测试与兼容性
+- 默认展示**需关注**的 SQL；点击“一致”只看一致结果。
+- 左右对齐展示两端计划，差异行和变化文本标色。
+- 返回码 `0` 表示完整比较且一致，`1` 表示完整比较且有变化，`3` 表示部分未完成，查看报告中的原因。计划变化不等于性能变差。
 
-2026-10-15 对 6.5.3、6.5.12、Enterprise Release 7.1.9-0.3 / Core 8.5.5 的最终在线检查为 **1,233 通过、27 失败**；368 项离线单元测试通过。原生 Linux 包在 CentOS 8 / x86_64 / glibc 2.28 做过验证。这里没有将 8.5.5 的结果表述为 8.5.8 认证，也不承诺所有 TiDB SQL、TiFlash / MPP 或 Linux 环境均已支持。
+每次重跑请使用新的 `DEMO_DB` 和输出目录，工具不会覆盖已有结果。
 
-公开仓库保留合成数据、脱敏计划夹具和严格失败断言；原始服务器配置、内部设计链接和现场证据不随源码发布。CI 运行离线测试及打包检查，不连接真实集群。详见 [验证结果](docs/validation.md)。
+## 版本、限制和开发
 
-## 开发与文档
+这是早期版本，尚不支持所有 SQL 场景。分区统计回放、TiDB 6.5 的部分 Prepared EXPLAIN 等限制见 [验证说明](docs/validation.md)。0.1.3 主要改进报告展示，三集群兼容性结果沿用 0.1.2；本次没有重新做全量在线认证。
 
-- [架构、数据流与契约](docs/architecture.md)
-- [操作说明与安全边界](docs/operations.md)
-- [验证结果、已知问题及在线测试入口](docs/validation.md)
-- [Linux 离线构建](docs/distribution.md)
-- [贡献指南](CONTRIBUTING.md) · [安全问题报告](SECURITY.md)
+[所有 Release](https://github.com/jielun132/pcc_kernel/releases) · [更新记录](CHANGELOG.md) · [详细原理与 SDK](docs/architecture.md) · [操作说明](docs/operations.md) · [源码安装与贡献](CONTRIBUTING.md) · [构建说明](docs/distribution.md)
 
-默认开发分支为 `main`。欢迎通过 Issue 提交脱敏复现，或通过 Pull Request 提交修复和回归测试；已知失败优先于扩大兼容性声明。
-
-## 许可证
-
-本项目按 [Apache License 2.0](LICENSE) 开源。第三方组件保留各自许可证，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+许可证：[Apache-2.0](LICENSE)。
