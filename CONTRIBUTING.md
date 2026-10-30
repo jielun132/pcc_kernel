@@ -4,13 +4,14 @@
 
 ## 本地开发
 
-使用 CPython 3.11：
+使用 CPython 3.11；完整离线测试还需要本机 `node` 命令，用于报告交互测试。PCC 本身及生成的报告不依赖 Node.js。
 
 ```bash
 python3.11 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.lock
 .venv/bin/python -m pip install --no-deps -e .
 .venv/bin/python -m pytest -q tests/unit
+.venv/bin/python scripts/check_case_catalog.py --base-auto
 .venv/bin/pcc doctor
 .venv/bin/python -m build --no-isolation
 ```
@@ -24,6 +25,7 @@ python3.11 -m venv .venv
 - Golden 同时检查应出现的差异与不应出现的误报；未知语义和失败不应变成 same。
 - 新依赖保持必要且锁定版本；许可证同时更新到 THIRD_PARTY_NOTICES.md。
 - 文档说明实际运行过的验证；模拟连接和合成夹具不能替代真实 TiDB 认证。
+- 固定 SQL 用例维护在 [tests/cases/](tests/cases/README.md)，遵守该目录的 AGENTS.md：历史记录、顺序及锁文件只允许追加，修正用例也必须使用新编号。
 
 ## 在线测试
 

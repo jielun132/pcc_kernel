@@ -4,7 +4,7 @@
 
 公开安装包在 [GitHub Releases](https://github.com/jielun132/pcc_kernel/releases) 按版本提供。`Build release assets` 工作流在 Rocky Linux 8.10 / x86_64 / glibc 2.28 容器中构建，附带版本检查、doctor 和合成计划的离线 diff 验证；不连接真实 TiDB。实际构建信息见包内 `build-info.json`，完整兼容性以 [验证说明](validation.md) 为准。
 
-可将安装包及同名 `.sha256` 文件下载到同一目录后执行 `sha256sum -c pcc-core-0.1.3-linux-x86_64.tar.gz.sha256`，再解压使用。项目没有发布到 PyPI；Release 中的 wheel 需要 CPython 3.11，普通使用者优先下载自带运行时的 Linux 包。
+可将安装包及同名 `.sha256` 文件下载到同一目录后执行 `sha256sum -c pcc-core-0.1.4-linux-x86_64.tar.gz.sha256`，再解压使用（文件名须与实际下载版本一致；0.1.4 资产尚未发布）。项目没有发布到 PyPI；Release 中的 wheel 需要 CPython 3.11，普通使用者优先下载自带运行时的 Linux 包。
 
 在我方与声明基线匹配的原生 Linux 构建机上安装 `requirements-dev.lock` 及本项目后执行：
 

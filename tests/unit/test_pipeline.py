@@ -50,6 +50,28 @@ def test_online_to_offline_equal(tmp_path, online):
     assert offline.summary == result.summary and offline.diffs == result.diffs
 
 
+def test_rule_facts_and_groups_are_core_artifacts_and_replay_identically(tmp_path, monkeypatch, online):
+    bundle, profiles, _, _ = online
+    def capture(q, side, profile, **kwargs):
+        new = side == 'new'
+        reader, scan = ('TableReader', 'TableRangeScan') if new else ('IndexReader', 'IndexRangeScan')
+        return PlanSnapshot(q.query_id, side, version=profile['expected_version'],
+                            columns=['id', 'estRows', 'task', 'access object', 'operator info'],
+                            rows=[[reader+'_1', '10', 'root', '', ('data:' if new else 'index:')+scan+'_2'],
+                                  ['└─'+scan+'_2', '10', 'cop[tikv]', 'table:t'+('' if new else ', index:i(id)'), '']])
+    monkeypatch.setattr(api, 'capture_plan', capture)
+    result = api.compare(CompareRequest(bundle.path, 'old', 'new', str(tmp_path / 'rules')), profiles=profiles)
+    offline = api.diff(DiffRequest(result.output_dir, str(tmp_path / 'offline-rules')))
+    assert result.summary['plan_findings'] == '4' and result.summary['changed'] == '4'
+    assert result.items == offline.items and result.diffs == offline.diffs
+    for name in ('findings.jsonl', 'similar_groups.json'):
+        assert (tmp_path / 'rules' / name).read_bytes() == (tmp_path / 'offline-rules' / name).read_bytes()
+        assert name in verify(tmp_path / 'rules')['files']
+    groups = json.loads((tmp_path / 'rules/similar_groups.json').read_text())
+    assert len(groups) == 1 and len(groups[0]['query_ids']) == 4
+    assert groups[0]['automatic_approval'] is False
+
+
 def test_partial_failures_and_repeated_material_checks_replay_identically(tmp_path, monkeypatch, online):
     bundle, profiles, _, capture = online
     monkeypatch.setattr(api, "verify_materials", lambda db, manifest: ({}, [{"code":"STATS_NOT_READY"}]))

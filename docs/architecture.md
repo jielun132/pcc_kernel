@@ -62,6 +62,20 @@ worker 独占连接，在同一连接执行 USE、白名单会话设置、普通
 
 归一化只消除临时算子 ID、数字表示等已确认的噪声。FullScan / RangeScan、PointGet / BatchPointGet、索引、范围、分区、Join 顺序与 Build/Probe 角色保留。未知属性保留原文，匹配有歧义时不任意配对。估算变化和 cost 不是性能倍率。
 
+### 节点对应、规则分类与归并
+
+节点在对应父节点的局部子节点列表中按以下顺序匹配：完整子树、对象＋算子＋属性、完整后代子树、访问对象、算子＋角色、算子。后代子树键保留算子、角色、任务、引擎、对象、谓词、未知属性和子节点顺序，忽略估算行数；它可在外层 Projection 的展示属性变化时识别具有不同范围谓词的 UNION 分支。每步仅选择双方唯一的键；最后只剩一对时作局部配对。单子节点包装层的增删单独识别，其他未匹配节点保留增删事件。剩余多对存在歧义时要求复核。字段事件的 `evidence.correspondence` 保存命中依据和父级范围，HTML 中的逐行排列只是展示，不重新决定差异。匹配器版本为 3。
+
+row/JSON 的列名别名和数值表示进入同一 IR；目前没有跨版本算子语义等价映射表，不把 IndexRangeScan、TableRangeScan、TableFullScan 等压成同一个类别后再比较。未知算子、字段或属性标签导致解析 `partial`，不能据此确认一致。
+
+`plan/findings.py` 在底层事件之上运行固定规则，在线 compare 和离线 diff 共用。规则版本记录在 `versions.rules_version`：
+
+- 同一 SQL 的同一访问位置中，扫描/点查算子、Reader/LookUp/Merge 父级、访问对象和计划明确列出的索引变化归并为一项 `access_path` 事实。链路对应必须唯一；不同访问位置、自连接中未确定的对应不得仅凭表名合并。每项保留全部规则名称、含义及事件引用。
+- Join 算法、角色及对应属性在同一节点归并；任务/引擎、子节点顺序、其他算子、属性和节点增删分别分类。`UNCLASSIFIED` 保留无法解释的观察，不作风险或性能判定。
+- `estimate_changed` 始终作为 `kind=auxiliary` 的估算行数变化单列，不并入访问路径事实。只有估算变化时，SQL 仍属于 changed，但 `plan_findings=0`。
+- `event_refs` 是该 SQL 在 `diffs.jsonl` 中的事件顺序号，从 1 开始。每条事件只归属一项事实；一项事实可命中多条规则，规则命中数不等于事实数或 SQL 数。
+- 相似分组仅包含可完整比较的计划事实，按类别、规则及旧新算子结构（含任务、引擎、角色）归类，不用表名、谓词或估算值决定相似。保留成员及各自对象，`review_status=pending_review`、`automatic_approval=false`；不自动批准或继承其他 SQL 的结论。
+
 ## 状态与产物
 
 | 层次 | 状态 |
@@ -69,9 +83,20 @@ worker 独占连接，在同一连接执行 USE、白名单会话设置、普通
 | capture_status | ok / failed / skipped / needs_sample |
 | parse_status | ok / partial / failed |
 | compare_status | same / changed / incomparable / not_run |
+| result_category | same / changed / unavailable |
 | run_status | completed / partial / blocked / interrupted |
 
 same 仅用于完整支持、材料满足条件的比较。未知语义、严重匹配歧义、缺材料不能计为 same。完整比较率分母包含选定的缺样例占位项；它不是全部业务 SQL 覆盖率。
+
+HTML 以“执行计划一致 / 存在差异 / 无法比对”三类互斥统计展示；`unavailable=incomparable+not_run`，三类之和等于选中样例数。`needs_sample` 是原因标记，不另加进总数。无法比对项在卡片内直接列出原因。
+
+报告采用目录与单条详情布局。目录支持每页 10 / 20 / 50 条，右侧只挂载当前 SQL；上一条、下一条可跨目录页切换。搜索、筛选和编号跳转针对全体记录。默认展示 SQL、简短差异摘要和并排计划，规则、证据、来源及报告口径按需展开；只改变估算值时不自动展开未变化的算子属性。完整数据仍嵌入离线 HTML，大批量材料的文件体积仍随内容增长。
+
+浏览分组独立于差异事实分组：数据库分组采用 SQL 默认库，跨库依赖继续显示在 SQL 与访问对象中；相似计划分组要求两侧可完整比较，按 old/new 两棵有序树的算子、角色、任务、引擎分组，忽略表名、谓词、估算值。分组不继承评审结论。按库“暂不审核”仅控制本次浏览范围，刷新恢复；全局数量和完整比较率不变。
+
+复制使用原始 row 计划，JSON 计划则按原始算子 ID 和字段还原带分支的文本，包含折叠节点的完整属性。剪贴板不可用时尝试本地复制，仍被拒绝则显示选中文本并提示手动复制，不显示虚假的成功提示。
+
+原 `summary.events` 继续表示所有底层观察事件，事件增加 `compare_status` 标识其 SQL 的比较状态。`confirmed_events` 仅计 changed SQL 中的事件，`unconfirmed_events` 计其余观察。`plan_findings` 和 `auxiliary_findings` 仅计确认的归并事实及辅助指标；无法比对的事实保留 `confirmed=false`，不计入这些差异统计或相似分组。
 
 ```text
 capture_bundle/
@@ -81,6 +106,7 @@ capture_bundle/
 
 comparison_result/
   manifest.json, summary.json, items.jsonl, diffs.jsonl, issues.jsonl
+  findings.jsonl, similar_groups.json
   inputs/, plans/, ir/
   events.jsonl, checkpoint.json, differences.csv, report.html
 ```

@@ -14,6 +14,12 @@ SQL 语义、字符集/排序规则、时区、引擎/MPP/Binding，以及显式
 
 `prepare` 只生成可审核的 SQL 和核验清单。已有对象必须先比对结构，人工跳过相应 CREATE；没有自动 DROP/TRUNCATE/ANALYZE 或 `--apply`。LOAD STATS 的绝对路径、MySQL 客户端 local infile 传输和精确补丁行为必须由隔离环境验证。PCC 自身连接始终关闭 local_infile 和多语句能力。
 
+`--targets old,new` 为两个配置名生成各自的 `import_commands.sql`、`verification.sql` 和 `plan.json`，结构与统计原文件共用 `prepared/materials/`。当前两个目标的导入 SQL 内容相同，不根据版本转换格式；该参数不表示向两个集群实际导入。时间范围和五维 Top N 在 `export` 选择，`prepare` 不再筛 SQL。
+
+导入脚本包含建库、建表及 `LOAD STATS`。独立且没有同名库的两个目标，首次执行各自脚本时才会建库；无需提前手工建库。若报“数据库已存在”，先记录完整报错行号、实际脚本和目标 DDL 历史，再核对连接及环境状态；仅凭步骤文档或后续报告不能确定是谁、何时创建了库。不要直接加 `IF NOT EXISTS` 或 `mysql --force` 将错误跳过并当成导入完整成功。
+
+示例中的 `sleep 5` 只给统计加载留出时间，不是就绪校验；`compare --stats-retries 5` 仍会按现有逻辑检查并重试。空目标表不能通过重新 `ANALYZE` 来代替导入源统计。当前 `stats:partial[...]` 会作为计划属性差异保留，不能把等待或成功获得 EXPLAIN 当成所有统计已经完整加载的证明。
+
 compare 前后核对对象 DDL、表/分区行数、列/索引统计明细和连接上下文；已返回的计划含 pseudo 或统计加载超时仍判 STATS_NOT_READY，保留有限重试的所有原始结果。自动 Analyze、外部写入等由 DBA 控制，PCC 只核验。
 
 建议源端和两个目标都配置各自的 `status_url`。通过 SQL 集群节点清单与 `/status` 的版本、Git hash 验证同源后，PCC 比较持久化统计内容，避免把节点尚未加载的直方图误判为不同统计。原始 JSON 保持不变；语义指纹仅排除采集/使用时间元数据、TSO 更新版本，并规范化 FM Sketch 哈希集合顺序，保留桶、TopN、sketch 值、行数、NDV、大小、相关性与统计版本。未配置目标 Status API 时继续保守核对 `SHOW STATS`；节点惰性加载导致明细不全会返回 `STATS_NOT_READY`，不会假定相同。通过白名单 `tidb_stats_load_sync_wait` 可指定本次 EXPLAIN 的统计同步加载等待时间。
@@ -23,3 +29,18 @@ compare 前后核对对象 DDL、表/分区行数、列/索引统计明细和连
 产物含业务 SQL、schema 和统计上下文，应按用户数据管理。文件默认为 0600，输出工作目录为 0700；不包含连接密码/令牌。报告中的原文全部 HTML 转义，CSV 对危险前缀进行防公式处理。ZIP 解包函数只接受受限相对路径、普通文件和目录，拒绝符号链接及越界；CLI 目前使用目录材料包。
 
 退出码 3 优先于发现差异的 1。缺样例、失败、未知语义、匹配歧义和材料不完整不会计为 same。离线 `diff` 使用归档的原始计划与当前算法重新解析、匹配，不读取网络配置、不解析凭据、不连接数据库。
+
+## 导出目录中的文件
+
+| 文件或目录 | 用途 |
+|---|---|
+| `manifest.json` | 材料包清单，记录来源、版本、库表对象、状态以及文件 hash；读取包时用于完整性核验。 |
+| `queries.jsonl` | 每行一个 SQL 样例，含原 SQL、默认库、参数、来源、指标、依赖和样例问题。 |
+| `selection.json` | 时间范围、筛选条件、排名维度及 Top N 等选择依据；显式 SQL 输入会记录相应输入模式。 |
+| `context.json` | 源版本、采集会话、SQL/Status 身份、Bindings、TiFlash 和采集覆盖等上下文。 |
+| `metadata_backup/` | 导出的建库、建表、建视图 DDL；不含业务表数据。 |
+| `statistics_backup/` | Status API 导出的原始统计 JSON，用于 `LOAD STATS`；不含业务行数据。 |
+| `table_list.txt` | 入包的依赖对象清单，采用带库名的对象名。 |
+| `skipped_tables.txt` | 带对象信息的跳过或异常条目；为空不代表其他问题均不存在。 |
+| `issues.jsonl` | SQL 样例、依赖、统计或采集过程中记录的问题；用于解释 `partial`。 |
+| `checkpoint.json` | 输出检查点，记录本次指纹及已写文件的校验信息；不是数据库备份。 |

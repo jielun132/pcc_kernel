@@ -238,8 +238,10 @@ def prepare(request: PrepareRequest, *, profiles=None, on_event=None) -> dict:
 
 
 def _summarize(queries, snapshots, fingerprint, issues, interrupted=False):
+    from pcc_tool.plan.findings import classify_findings
     items, diffs, irs = [], [], {}
     for q in queries:
+        events = []
         item_issues = [i for i in issues if (not i.get("query_id") or i["query_id"] == q.query_id)
                        and (not i.get("object") or i["object"] in q.dependencies)]
         item = {"query_id": q.query_id, "compare_status": "not_run", "needs_sample": q.executable_status == "needs_sample",
@@ -259,6 +261,9 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False):
             item["compare_status"] = "incomparable"
             if all(p[0].capture_status == "ok" for p in pair):
                 events, review = compare_ir(pair[0][1], pair[1][1])
+                if any(e.type == "ambiguous_match" for e in events):
+                    item_issues.append({"code": "PLAN_MATCH_AMBIGUOUS", "query_id": q.query_id,
+                                        "message": "局部节点无法唯一对应，保留观察结果，不能完整比较"})
                 diffs.extend(events)
                 contexts = [p[0].context.get("session", {}) for p in pair]
                 if contexts[0] != contexts[1]:
@@ -282,6 +287,11 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False):
         # as well as successful ones, without multiplying or hiding any issue.
         unique = {digest(i): i for i in item_issues}
         item["issues"] = [unique[key] for key in sorted(unique)]
+        item["result_category"] = item["compare_status"] if item["compare_status"] in {"same", "changed"} else "unavailable"
+        for event in events:
+            event.compare_status = item["compare_status"]
+        item["findings"] = classify_findings(irs.get((q.query_id, "old")), irs.get((q.query_id, "new")),
+                                             events, item["compare_status"])
         items.append(item)
     counts = {status: sum(i["compare_status"] == status for i in items) for status in ("same", "changed", "incomparable", "not_run")}
     selected = len(queries)
@@ -295,6 +305,12 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False):
                "full_comparisons": full, **counts, "needs_sample": sum(i["needs_sample"] for i in items),
                "events": len(diffs), "complete_comparison_rate": str(Decimal(full) / Decimal(selected)) if selected else None,
                "coverage_denominator": "selected_samples_including_unresolved", "business_coverage": "unknown"}
+    findings = [f for item in items for f in item["findings"]]
+    summary.update(unavailable=counts["incomparable"] + counts["not_run"],
+                   confirmed_events=sum(e.compare_status == "changed" for e in diffs),
+                   unconfirmed_events=sum(e.compare_status != "changed" for e in diffs),
+                   plan_findings=sum(f["confirmed"] and f["kind"] == "plan" for f in findings),
+                   auxiliary_findings=sum(f["confirmed"] and f["kind"] == "auxiliary" for f in findings))
     status = "interrupted" if interrupted else "blocked" if not selected else "partial" if full != selected else "completed"
     if not selected:
         issues = [*issues, {"code": "NO_QUERIES_SELECTED"}]
@@ -306,10 +322,13 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False):
 
 
 def _write_result(root, result, bundle, snapshots, irs, events):
+    from pcc_tool.plan.findings import similar_groups
     write_json(root / "summary.json", result.summary)
     write_jsonl(root / "items.jsonl", result.items)
     write_jsonl(root / "diffs.jsonl", result.diffs)
     write_jsonl(root / "issues.jsonl", result.issues)
+    write_jsonl(root / "findings.jsonl", [f for item in result.items for f in item.get("findings", [])])
+    write_json(root / "similar_groups.json", similar_groups(result.items))
     write_jsonl(root / "inputs/queries.jsonl", bundle.queries)
     write_json(root / "inputs/context.json", bundle.context)
     write_json(root / "inputs/selection.json", bundle.selection)
@@ -479,7 +498,7 @@ def diff(request: DiffRequest, *, on_event=None, cancel=None) -> ComparisonResul
     events.emit("diff_started", fingerprint=fingerprint)
     # Keep capture/preflight failures, but recalculate parser/matcher findings with current algorithms.
     issues = [i for i in read_jsonl(root / "issues.jsonl") if i.get("code") not in
-              {"PLAN_PARSE_FAILED", "PLAN_SEMANTICS_UNKNOWN", "CONTEXT_DIFFERENCE"}]
+              {"PLAN_PARSE_FAILED", "PLAN_SEMANTICS_UNKNOWN", "PLAN_MATCH_AMBIGUOUS", "CONTEXT_DIFFERENCE"}]
     result, irs = _summarize(queries, snapshots, fingerprint, issues, bool(cancel and cancel.is_set()))
     with Publication(request.out, fingerprint, request.resume) as publication:
         result.output_dir = str(publication.output)
