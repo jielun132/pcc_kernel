@@ -10,7 +10,7 @@
 
 在能连接三套 TiDB 的 **Linux x86_64** 机器上执行，使用 Bash。原生包自带 Python；运行机需要 glibc 2.28 或以上，导入步骤另需 MySQL 8 客户端。
 
-以下下载命令适用于 v0.1.4 的 Release 资产发布后。当前 0.1.4 为本地源码版本，尚未上传安装包；现在验证此版本请按[本地开发说明](CONTRIBUTING.md#本地开发)安装源码。
+以下下载命令适用于 v0.1.4 的 Release 资产发布后。当前 0.1.4 为源码版本，尚未上传安装包；现在验证此版本请按[本地开发说明](CONTRIBUTING.md#本地开发)安装源码。
 
 ```bash
 curl -fLO https://github.com/jielun132/pcc_kernel/releases/download/v0.1.4/pcc-core-0.1.4-linux-x86_64.tar.gz

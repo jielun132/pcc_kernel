@@ -2,7 +2,7 @@
 
 所有公开版本均保留在 [GitHub Releases](https://github.com/jielun132/pcc_kernel/releases)，每个 Release 对应独立 Git 标签，不覆盖旧版本。
 
-## 0.1.4 — 2026-10-30（本地版本，待发布）
+## 0.1.4 — 2026-10-30（源码版本，安装包待发布）
 
 ### 核心比较
 
