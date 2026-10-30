@@ -4,13 +4,14 @@
 
 ## 本地开发
 
-使用 CPython 3.11：
+使用 CPython 3.11；完整离线测试还需要本机 `node` 命令，用于报告交互测试。PCC 本身及生成的报告不依赖 Node.js。
 
 ```bash
 python3.11 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.lock
 .venv/bin/python -m pip install --no-deps -e .
 .venv/bin/python -m pytest -q tests/unit
+.venv/bin/python scripts/check_case_catalog.py --base-auto
 .venv/bin/pcc doctor
 .venv/bin/python -m build --no-isolation
 ```
@@ -24,6 +25,7 @@ python3.11 -m venv .venv
 - Golden 同时检查应出现的差异与不应出现的误报；未知语义和失败不应变成 same。
 - 新依赖保持必要且锁定版本；许可证同时更新到 THIRD_PARTY_NOTICES.md。
 - 文档说明实际运行过的验证；模拟连接和合成夹具不能替代真实 TiDB 认证。
+- 固定 SQL 用例维护在 [tests/cases/](tests/cases/README.md)，遵守该目录的 AGENTS.md：历史记录、顺序及锁文件只允许追加，修正用例也必须使用新编号。
 
 ## 在线测试
 
@@ -33,10 +35,14 @@ python3.11 -m venv .venv
 
 ## 发布与打包
 
+维护者要求“提交代码”时，默认执行完整发布流程：更新版本和文档，commit / push，创建或更新 PR，等待 CI 通过后主动合并到 `main`，再构建、验证并发布对应 GitHub Release。不能仅停在本地提交或未合并的 PR。用户指定版本时按指定版本；未指定时沿用当前未发布的目标版本，若当前版本已发布则递增补丁号。流程失败时保留证据、修复并说明阻塞，不跳过检查。
+
 wheel / sdist 可在开发环境构建；原生 Linux 包必须在声明的发行版、CPU 与 glibc 基线上构建并验证，流程见 [distribution.md](docs/distribution.md)。构建完成不自动等于兼容性认证。
 
 每次发布都更新 `pyproject.toml`、`src/pcc_tool/__init__.py` 中的版本号，并在 [CHANGELOG.md](CHANGELOG.md) 写明改动、验证结果和仍存在的限制。README 的版本号及下载地址一并更新。
 
 通过 PR 合并且 CI 通过后，在 Actions 手动运行 **Build release assets**。它从当前提交构建 Rocky Linux 8.10 / x86_64 / glibc 2.28 原生包并执行离线冒烟验证。构建通过后，为这个已验证的提交创建 `vX.Y.Z` 标签和 GitHub Release，上传构建产物及校验文件，填写对应版本的更新说明。保留每个历史标签和 Release，不覆盖旧版资产；从 [Releases](https://github.com/jielun132/pcc_kernel/releases) 查看所有版本。
+
+发布后安全同步本地 `main`，核对远端提交、标签、Release 资产、README 下载入口与版本号一致，更新已有的本地交接材料。最终提供 PR / Release 链接和验证结果；不要覆盖本地无关修改，也不要把发布构建通过写成真实数据库版本认证。
 
 项目采用 [Apache-2.0](LICENSE)。提交贡献时，请确保有权按该许可证贡献相应内容，并保留第三方声明。

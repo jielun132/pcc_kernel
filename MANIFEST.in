@@ -3,6 +3,6 @@ recursive-include docs *.md
 exclude docs/test-report-*.md docs/sql-coverage-report-*.md
 exclude plan.md AGENTS.md
 recursive-include examples *.json *.jsonl *.html *.csv *.sql
-recursive-include tests *.py *.md *.sql *.json *.txt
+recursive-include tests *.py *.md *.sql *.json *.jsonl *.txt *.cjs
 recursive-include scripts *.py
 recursive-include packaging *.py

@@ -19,14 +19,29 @@ def objects(node: PlanNode) -> tuple:
     return tuple(sorted(v for child in node.children for v in objects(child)))
 
 
+def descendant_key(node: PlanNode):
+    """Anchor a wrapper through its descendants without using estimated row counts.
+
+    A Projection's display attributes can change across versions while distinct
+    UNION branches still have exactly matching range predicates below it. Require
+    a unique, full ordered descendant signature on both sides; never pair by row.
+    """
+    def semantic(child):
+        return (child.operator, child.task, child.engine, child.access, child.attributes,
+                child.role, child.unknown, [semantic(c) for c in child.children])
+    return (node.operator, node.role, digest([semantic(c) for c in node.children])) if node.children else None
+
+
 def compare_ir(old: PlanIR, new: PlanIR) -> tuple[list[DiffEvent], bool]:
     events = []
+    correspondences = {}
     review = old.parse_status != "ok" or new.parse_status != "ok"
 
     def emit(kind, left, right, field, before, after, confidence="high", requires_review=False, **evidence):
         events.append(DiffEvent(old.query_id, kind, left.node_id if left else None,
                                 right.node_id if right else None, field, primitive(before), primitive(after),
                                 {"old": left.evidence if left else None, "new": right.evidence if right else None,
+                                 "correspondence": correspondences.get((left.node_id, right.node_id)) if left and right else None,
                                  **evidence}, confidence, requires_review))
 
     def unmatched(node, added):
@@ -59,9 +74,11 @@ def compare_ir(old: PlanIR, new: PlanIR) -> tuple[list[DiffEvent], bool]:
         li, ri, pairs = set(range(len(left))), set(range(len(right))), []
         key_functions = [lambda n: digest(shape(n)),
                          lambda n: (objects(n), n.operator, n.attributes),
+                         descendant_key,
                          lambda n: objects(n) or None,
                          lambda n: (n.operator, n.role), lambda n: n.operator]
-        for key in key_functions:
+        methods = ("equal_subtree", "object_operator_attributes", "unique_descendants", "accessed_objects", "operator_role", "operator")
+        for method, key in zip(methods, key_functions):
             lc, rc = Counter(key(left[i]) for i in li), Counter(key(right[i]) for i in ri)
             right_by_key = {key(right[j]): j for j in sorted(ri) if rc[key(right[j])] == 1}
             for i in sorted(li):
@@ -69,10 +86,17 @@ def compare_ir(old: PlanIR, new: PlanIR) -> tuple[list[DiffEvent], bool]:
                 if token is not None and lc[token] == 1 and token in right_by_key:
                     j = right_by_key[token]
                     pairs.append((i, j))
+                    correspondences[left[i].node_id, right[j].node_id] = {
+                        "method": method, "scope": [parent_old.node_id if parent_old else None,
+                                                   parent_new.node_id if parent_new else None]}
                     li.remove(i)
                     ri.remove(j)
         if len(li) == len(ri) == 1:
-            pairs.append((li.pop(), ri.pop()))
+            i, j = li.pop(), ri.pop()
+            pairs.append((i, j))
+            correspondences[left[i].node_id, right[j].node_id] = {
+                "method": "sole_remaining_pair", "scope": [parent_old.node_id if parent_old else None,
+                                                           parent_new.node_id if parent_new else None]}
         # A replacement access-path parent can have entirely different operator
         # families below it (e.g. TableReader/Selection -> IndexMerge/scans).
         # Report removals/additions without inventing an ambiguous correspondence.

@@ -66,6 +66,26 @@ def test_ambiguous_self_join(snapshot):
     assert compare_ir(parse_plan(snapshot(a)), parse_plan(snapshot(a))) == ([], False)
 
 
+def test_repeated_union_wrappers_use_unique_descendants_without_hiding_attributes():
+    from pcc_tool.models import PlanIR, PlanNode
+    def branch(i, new=False):
+        leaf = PlanNode(f's{i}', 'IndexRangeScan', access='table:orders,index:idx_customer(customer_id)',
+                        attributes=f'range:[{i},{i}]', estimate='9' if new else '10')
+        return PlanNode(f'p{i}', 'Projection', attributes='orders.id->Column#21' if new else 'orders.id', children=[leaf])
+    old = PlanIR('q',[PlanNode('root','Union',children=[branch(1),branch(2)])])
+    new = PlanIR('q',[PlanNode('root','Union',children=[branch(2,True),branch(1,True)])])
+    events, review = compare_ir(old,new)
+    assert not review
+    assert {e.type for e in events} == {'predicate_or_attribute_changed','estimate_changed','child_order_changed'}
+    attributes = [e for e in events if e.type == 'predicate_or_attribute_changed']
+    assert len(attributes) == 2
+    assert all(e.old_node == e.new_node and e.evidence['correspondence']['method']=='unique_descendants' for e in attributes)
+    # Indistinguishable branches remain ambiguous, including when only estimates differ.
+    old.roots[0].children[1].children[0].attributes='range:[1,1]'
+    new.roots[0].children[0].children[0].attributes='range:[1,1]'
+    assert compare_ir(old,new)[1]
+
+
 def test_json_and_row_same(snapshot):
     # Documented TiDB JSON shape; fixture provenance is recorded in fixtures/README.md.
     raw = [{"id": "Projection_4", "estRows": "10.00", "taskType": "root", "operatorInfo": "test.t.id", "subOperators": [
