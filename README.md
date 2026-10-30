@@ -2,7 +2,7 @@
 
 **把同一批 SQL 放到升级前、升级后的 TiDB 中，比较执行计划，并生成 HTML 报告。**
 
-当前源码版本：**0.1.4** · [已发布版本](https://github.com/jielun132/pcc_kernel/releases) · [更新记录](CHANGELOG.md)
+当前版本：**0.1.4** · [下载与所有版本](https://github.com/jielun132/pcc_kernel/releases) · [更新记录](CHANGELOG.md)
 
 下面按一个完整 Demo 走四步。准备三套相互独立的 TiDB：`prod` 模拟生产环境，`old` 模拟升级前，`new` 模拟升级后。PCC 只对待比较 SQL 执行普通 `EXPLAIN`，不会执行业务 DML。
 
@@ -10,7 +10,7 @@
 
 在能连接三套 TiDB 的 **Linux x86_64** 机器上执行，使用 Bash。原生包自带 Python；运行机需要 glibc 2.28 或以上，导入步骤另需 MySQL 8 客户端。
 
-以下下载命令适用于 v0.1.4 的 Release 资产发布后。当前 0.1.4 为源码版本，尚未上传安装包；现在验证此版本请按[本地开发说明](CONTRIBUTING.md#本地开发)安装源码。
+安装包和校验文件见 [v0.1.4 Release](https://github.com/jielun132/pcc_kernel/releases/tag/v0.1.4)；从源码开发请参考[本地开发说明](CONTRIBUTING.md#本地开发)。
 
 ```bash
 curl -fLO https://github.com/jielun132/pcc_kernel/releases/download/v0.1.4/pcc-core-0.1.4-linux-x86_64.tar.gz
