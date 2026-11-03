@@ -237,8 +237,9 @@ def prepare(request: PrepareRequest, *, profiles=None, on_event=None) -> dict:
             "run_status": "partial" if bundle.issues else "completed"}
 
 
-def _summarize(queries, snapshots, fingerprint, issues, interrupted=False):
+def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, assessment_schema=None):
     from pcc_tool.plan.findings import classify_findings
+    from pcc_tool.plan.assessment import detect, evaluate
     items, diffs, irs = [], [], {}
     for q in queries:
         events = []
@@ -292,6 +293,10 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False):
             event.compare_status = item["compare_status"]
         item["findings"] = classify_findings(irs.get((q.query_id, "old")), irs.get((q.query_id, "new")),
                                              events, item["compare_status"])
+        item["assessment_evidence"] = detect(q, irs.get((q.query_id, "old")), irs.get((q.query_id, "new")),
+            events, item["compare_status"], item["issues"], assessment_schema,
+            {side: snapshots.get((q.query_id, side)) for side in ("old", "new")})
+        item["assessment"] = evaluate(item["assessment_evidence"])
         items.append(item)
     counts = {status: sum(i["compare_status"] == status for i in items) for status in ("same", "changed", "incomparable", "not_run")}
     selected = len(queries)
@@ -311,6 +316,8 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False):
                    unconfirmed_events=sum(e.compare_status != "changed" for e in diffs),
                    plan_findings=sum(f["confirmed"] and f["kind"] == "plan" for f in findings),
                    auxiliary_findings=sum(f["confirmed"] and f["kind"] == "auxiliary" for f in findings))
+    summary["assessment"] = {key: sum(i["assessment"]["status"] == key for i in items)
+                             for key in ("better", "worse", "equivalent", "review", "excluded")}
     status = "interrupted" if interrupted else "blocked" if not selected else "partial" if full != selected else "completed"
     if not selected:
         issues = [*issues, {"code": "NO_QUERIES_SELECTED"}]
@@ -321,19 +328,26 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False):
     return ComparisonResult(fingerprint, primitive(summary), items, diffs, list(unique_issues.values()), status), irs
 
 
-def _write_result(root, result, bundle, snapshots, irs, events):
+def _write_result(root, result, bundle, snapshots, irs, events, assessment_schema=None):
     from pcc_tool.plan.findings import similar_groups
+    from pcc_tool.plan.rule_catalog import ASSESSMENT_VERSION, RULE_CATALOG, DEFAULT_RULES, DEFAULT_THRESHOLDS
     write_json(root / "summary.json", result.summary)
     write_jsonl(root / "items.jsonl", result.items)
     write_jsonl(root / "diffs.jsonl", result.diffs)
     write_jsonl(root / "issues.jsonl", result.issues)
     write_jsonl(root / "findings.jsonl", [f for item in result.items for f in item.get("findings", [])])
     write_json(root / "similar_groups.json", similar_groups(result.items))
+    write_json(root / "assessment_rules.json", {"version": ASSESSMENT_VERSION, "rules": RULE_CATALOG,
+        "selected": DEFAULT_RULES, "thresholds": DEFAULT_THRESHOLDS, "report_fingerprint": result.fingerprint,
+        "rules_fingerprint": digest(RULE_CATALOG)})
+    write_jsonl(root / "assessments.jsonl", [{"query_id": i["query_id"], "evidence": i["assessment_evidence"],
+                                             "result": i["assessment"]} for i in result.items])
     write_jsonl(root / "inputs/queries.jsonl", bundle.queries)
     write_json(root / "inputs/context.json", bundle.context)
     write_json(root / "inputs/selection.json", bundle.selection)
     write_json(root / "inputs/manifest.json", bundle.manifest)
     write_jsonl(root / "inputs/issues.jsonl", bundle.issues)
+    write_json(root / "inputs/assessment_schema.json", assessment_schema or {})
     for side in ("old", "new"):
         write_jsonl(root / f"plans/{side}.jsonl", [snapshots[q.query_id, side] for q in bundle.queries if (q.query_id, side) in snapshots])
         write_jsonl(root / f"ir/{side}.jsonl", [irs[q.query_id, side] for q in bundle.queries if (q.query_id, side) in irs])
@@ -354,6 +368,8 @@ def compare(request: CompareRequest, *, profiles=None, on_event=None, cancel=Non
     if request.old == request.new:
         raise PCCError("INVALID_CONFIG", "old 和 new 必须是两套独立目标")
     bundle = load_bundle(request.bundle)
+    from pcc_tool.plan.assessment import schema_evidence
+    assessment_schema = schema_evidence(bundle)
     target_profiles = {"old": profile_named(profiles, request.old), "new": profile_named(profiles, request.new)}
     if any(p.get("role") != "test" for p in target_profiles.values()):
         raise PCCError("TARGET_NOT_ISOLATED", "compare 只连接配置中明确 role=test 的隔离环境")
@@ -461,10 +477,10 @@ def compare(request: CompareRequest, *, profiles=None, on_event=None, cancel=Non
                         pre_issues.append({"code": "BINDINGS_DRIFT", "side": side})
             except PCCError as exc:
                 pre_issues.append({"code": "POSTCHECK_FAILED", "side": side, "cause": exc.code})
-        result, irs = _summarize(bundle.queries, snapshots, fingerprint, pre_issues, cancel.is_set())
+        result, irs = _summarize(bundle.queries, snapshots, fingerprint, pre_issues, cancel.is_set(), assessment_schema)
         result.output_dir = str(publication.work if cancel.is_set() else publication.output)
         events.emit("compare_completed", run_status=result.run_status, summary=result.summary, exit_code=result.exit_code)
-        _write_result(root, result, bundle, snapshots, irs, events)
+        _write_result(root, result, bundle, snapshots, irs, events, assessment_schema)
         publication.checkpoint(run_status=result.run_status, completed=[list(k) for k in sorted(snapshots)])
         manifest = {"kind": "ComparisonResult", "versions": VERSIONS, "run_status": result.run_status,
                     "business_fingerprint": digest(business_value({"items": result.items, "diffs": result.diffs})),
@@ -492,18 +508,20 @@ def diff(request: DiffRequest, *, on_event=None, cancel=None) -> ComparisonResul
             if snapshot.side != side or key in snapshots or snapshot.query_id not in query_ids:
                 raise PCCError("ARTIFACT_INVALID", "归档计划身份不匹配或重复")
             snapshots[key] = snapshot
+    schema_path = root / "inputs/assessment_schema.json"
+    assessment_schema = read_json(schema_path) if schema_path.exists() else {}
     fingerprint = digest(business_value({"inputs": _bundle_business(bundle), "snapshots": [snapshots[k] for k in sorted(snapshots)],
-                                         "versions": VERSIONS}))
+                                         "versions": VERSIONS, "assessment_schema": assessment_schema}))
     events = Events(on_event)
     events.emit("diff_started", fingerprint=fingerprint)
     # Keep capture/preflight failures, but recalculate parser/matcher findings with current algorithms.
     issues = [i for i in read_jsonl(root / "issues.jsonl") if i.get("code") not in
               {"PLAN_PARSE_FAILED", "PLAN_SEMANTICS_UNKNOWN", "PLAN_MATCH_AMBIGUOUS", "CONTEXT_DIFFERENCE"}]
-    result, irs = _summarize(queries, snapshots, fingerprint, issues, bool(cancel and cancel.is_set()))
+    result, irs = _summarize(queries, snapshots, fingerprint, issues, bool(cancel and cancel.is_set()), assessment_schema)
     with Publication(request.out, fingerprint, request.resume) as publication:
         result.output_dir = str(publication.output)
         events.emit("diff_completed", run_status=result.run_status, summary=result.summary, exit_code=result.exit_code)
-        _write_result(publication.work, result, bundle, snapshots, irs, events)
+        _write_result(publication.work, result, bundle, snapshots, irs, events, assessment_schema)
         publication.checkpoint(run_status=result.run_status)
         publication.publish({"kind": "ComparisonResult", "versions": VERSIONS, "run_status": result.run_status,
                              "business_fingerprint": digest(business_value({"items": result.items, "diffs": result.diffs})),

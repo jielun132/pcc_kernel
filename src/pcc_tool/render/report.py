@@ -8,6 +8,7 @@ from pcc_tool.artifacts.store import write_bytes
 from pcc_tool.models import canonical, primitive
 from pcc_tool.render.findings import comparison_method, findings_panel, grouping_panel, unavailable_reason
 from pcc_tool.render.navigation import NAV_STYLES, SCRIPT, navigation_markup, plan_copy_text, plan_group
+from pcc_tool.render.assessment import ASSESSMENT_SCRIPT, ASSESSMENT_STYLES, assessment_markup
 
 STATUS_LABELS = {"same": "执行计划一致", "changed": "存在差异", "incomparable": "无法比对", "not_run": "无法比对"}
 EVENT_LABELS = {"node_added": "新增算子", "node_removed": "移除算子", "operator_changed": "算子变化",
@@ -519,7 +520,7 @@ def render_reports(root, result, queries, snapshots, irs, selection, context):
                      f'<pre class="sql">{escaped(q.sql_text or "缺少可执行样例")}</pre>'
                      + (f'<details class="parameters"><summary>参数 · {len(q.parameters)} 个</summary><p class="overview-note">参数样例用于重新优化，不复现计划缓存。</p><pre>{escaped(q.parameters)}</pre></details>' if q.parameters is not None else '')
                      +
-                     f'{note}{facts_html}<div class="plan-toolbar"><h3>执行计划</h3>'
+                     f'{note}<div class="query-assessment" aria-live="polite"></div>{facts_html}<div class="plan-toolbar"><h3>执行计划</h3>'
                      '<div class="plan-actions"><label><input class="expand-plan" type="checkbox"> 展开详情</label>'
                      '<button type="button" class="copy-plan" data-copy-plan="both">复制两侧</button></div></div>'
                      '<div class="plan-meta"><div class="legend"><span><mark class="removed">旧值</mark></span><span><mark class="added">新值</mark></span></div>'
@@ -529,8 +530,10 @@ def render_reports(root, result, queries, snapshots, irs, selection, context):
                      f'<p class="id">{escaped(q.query_id)}</p>{diff_html}<div class="raw-plans">{"".join(sides)}</div>'
                      f'<details><summary>排名、来源、覆盖与问题</summary><pre>{escaped({"metrics": q.metrics, "origins": q.sample_origins, "item": item})}</pre></details></details></article>')
         group_key, group_title = plan_group(irs, q.query_id, status)
-        records.append(dict(id=anchor, number=index, schema=q.schema, status=status, category=category,
+        records.append(dict(id=anchor, queryId=q.query_id, number=index, schema=q.schema, status=status, category=category,
                             attention=needs_attention, needsSample=bool(item.get("needs_sample")),
+                            assessment=item.get("assessment"), assessmentEvidence=item.get("assessment_evidence", dict(
+                                scope=status, event_refs=[str(i) for i in range(1, len(events) + 1)], matches=[], hints=[], blockers=["没有规则证据"])),
                             planGroup=group_key, planTitle=group_title,
                             preview=" ".join((q.sql_text or "缺少可执行样例").split())[:100],
                             search=(q.schema + " " + q.query_id + " " + (q.sql_text or "") + " " +
@@ -540,7 +543,7 @@ def render_reports(root, result, queries, snapshots, irs, selection, context):
                             html=cards[-1]))
     report = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
-<title>PCC 执行计划比较报告</title><style>''' + STYLES + NAV_STYLES + '</style></head><body><main><header><div class="heading"><div><p class="eyebrow">PCC</p><h1>执行计划比较</h1></div>'
+<title>PCC 执行计划比较报告 · 0.1.5</title><style>''' + STYLES + NAV_STYLES + ASSESSMENT_STYLES + '</style></head><body><main><header><div class="heading"><div><p class="eyebrow">PCC · 0.1.5</p><h1>执行计划比较</h1></div>'
     status_label = {"completed": "完成", "partial": "部分完成", "blocked": "前置条件不足", "interrupted": "已中断"}[result.run_status]
     report += f'<span class="run-status">{status_label}</span></div>'
     report += f'<p class="subtitle">{escaped(_versions(snapshots, "old"))}<span class="version-arrow">→</span>{escaped(_versions(snapshots, "new"))}</p>'
@@ -564,7 +567,8 @@ def render_reports(root, result, queries, snapshots, irs, selection, context):
         report += f'<p class="issue-note">{escaped(context["validation_note"])}</p>'
     report += report_overview(selection, context, result, queries, snapshots) + comparison_method()
     report += grouping_panel(result.items, queries) + '</div></details></div></header>'
+    report += assessment_markup(result.fingerprint)
     report += navigation_markup(records)
-    report += '</main><script>' + SCRIPT + '</script></body></html>'
+    report += '</main><script>' + ASSESSMENT_SCRIPT + SCRIPT + '</script></body></html>'
     write_bytes(root / "report.html", report.encode())
     write_bytes(root / "differences.csv", buffer.getvalue().encode("utf-8-sig"))

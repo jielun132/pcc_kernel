@@ -76,6 +76,8 @@ row/JSON 的列名别名和数值表示进入同一 IR；目前没有跨版本�
 - `event_refs` 是该 SQL 在 `diffs.jsonl` 中的事件顺序号，从 1 开始。每条事件只归属一项事实；一项事实可命中多条规则，规则命中数不等于事实数或 SQL 数。
 - 相似分组仅包含可完整比较的计划事实，按类别、规则及旧新算子结构（含任务、引擎、角色）归类，不用表名、谓词或估算值决定相似。保留成员及各自对象，`review_status=pending_review`、`automatic_approval=false`；不自动批准或继承其他 SQL 的结论。
 
+0.1.5 在事实层之上增加 `plan/assessment.py` 与 `plan/rule_catalog.py`，版本记录为 `assessment_version=3`。它们保留候选命中和差异覆盖证据，按用户选中的规则与阈值独立给出 better / worse / equivalent / review；一致和无法比对项为 excluded。`assessment_proof.py` 验证完整计划的组合变换并记录 `requires_rules`；`assessment_cost.py` 对支持的复杂取舍使用同一工作量模型，归档分量、权重及假设，明确标记估算而非实测。未知或不可靠输入拒绝分类；只有全部差异被覆盖且无冲突才分类，原始事实、比较状态及退出码不变。浏览器使用相同证据重算，阈值比较采用整数分数；规则范围和归档字段见[规则预判说明](rule-assessment.md)。
+
 ## 状态与产物
 
 | 层次 | 状态 |
@@ -107,6 +109,7 @@ capture_bundle/
 comparison_result/
   manifest.json, summary.json, items.jsonl, diffs.jsonl, issues.jsonl
   findings.jsonl, similar_groups.json
+  assessment_rules.json, assessments.jsonl
   inputs/, plans/, ir/
   events.jsonl, checkpoint.json, differences.csv, report.html
 ```
