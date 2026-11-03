@@ -105,8 +105,11 @@ let activeGroup=null, activeKey=null, activeId=null, page=0, filtered=[];
 const skipped=new Set();
 const labels={same:'一致',changed:'有差异',incomparable:'无法比对',not_run:'无法比对'};
 function element(tag,text,className){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el;}
+const assessment=typeof PCCAssessment==='undefined'?null:PCCAssessment.attach(records,clearView=>{
+  if(clearView){activeGroup=null;activeKey=null;search.value='';status.value='changed';skipped.clear();}resetPage();
+});
 function statusMatch(r){const s=status.value;return s==='attention'?r.attention:s==='needs_sample'?r.needsSample:s==='unavailable'?r.category==='unavailable':!s||r.status===s;}
-function baseMatch(r){return !skipped.has(r.schema)&&statusMatch(r)&&r.search.includes(search.value.trim().toLowerCase());}
+function baseMatch(r){return (!assessment||assessment.matches(r))&&!skipped.has(r.schema)&&statusMatch(r)&&r.search.includes(search.value.trim().toLowerCase());}
 function groupValue(r){return mode.value==='schema'?r.schema:r.planGroup;}
 function buildGroups(){
   const list=document.getElementById('group-list'), scroll=list.scrollTop;list.replaceChildren();
@@ -131,12 +134,15 @@ function render(){
   const selected=visible.find(r=>r.id===activeId)||visible[0];activeId=selected?.id||null;
   // HTML was generated and escaped by the report renderer, never composed from search/input values.
   if(!selected||!document.getElementById(selected.id))document.getElementById('sql-cards').innerHTML=selected?.html||'';
+  assessment?.detail(selected);
   const nav=document.getElementById('sql-nav');nav.replaceChildren();
   visible.forEach(r=>{
     const a=element('a');a.href='#'+r.id;a.dataset.queryLink='';a.dataset.status=r.status;a.setAttribute('aria-current',String(r.id===activeId));
     const heading=element('span',undefined,'nav-item-heading');heading.append(element('strong',`#${String(r.number).padStart(3,'0')}`),element('small',labels[r.status]));
     const schema=element('span',r.schema||'未指定库','nav-schema');schema.setAttribute('title',r.schema||'未指定库');
-    a.append(heading,element('span',r.preview,'nav-preview'),schema);nav.append(a);
+    a.append(heading,element('span',r.preview,'nav-preview'),schema);
+    if(assessment&&r.status==='changed')a.append(element('span',assessment.label(r),'nav-assessment assessment-'+assessment.status(r)));
+    nav.append(a);
   });
   document.getElementById('page-state').textContent=`${page+1} / ${pages}`;
   document.getElementById('previous-page').disabled=page===0;document.getElementById('next-page').disabled=page>=pages-1;
@@ -155,7 +161,7 @@ function resetPage(){page=0;document.getElementById('nav-message').textContent='
 function jump(id){
   const r=byId.get(id);if(!r)return false;
   if(!filtered.includes(r)){
-    activeGroup=null;activeKey=null;search.value='';status.value='';skipped.delete(r.schema);
+    activeGroup=null;activeKey=null;search.value='';status.value='';skipped.delete(r.schema);assessment?.clearFilter();
     document.getElementById('nav-message').textContent='已恢复该 SQL 所在库，并清除筛选以定位。';render();
   }
   page=Math.floor(filtered.indexOf(r)/Number(pageSize.value));activeId=id;render();
@@ -178,8 +184,8 @@ async function copyPlan(button){
   let copied=false;try{copied=!!document.execCommand('copy');}catch(error){/* Keep selected text for manual copy. */}
   if(copied){area.remove();feedback.textContent='已复制执行计划文本';button.focus();}else{feedback.textContent='浏览器未允许自动复制，文本已选中，请按 Cmd+C / Ctrl+C。';}
 }
-metrics.forEach(b=>b.addEventListener('click',()=>{activeGroup=null;activeKey=null;status.value=b.dataset.filter;resetPage();}));
-search.addEventListener('input',()=>{activeKey=null;resetPage();});status.addEventListener('change',()=>{activeKey=null;resetPage();});
+metrics.forEach(b=>b.addEventListener('click',()=>{activeGroup=null;activeKey=null;status.value=b.dataset.filter;assessment?.clearFilter();resetPage();}));
+search.addEventListener('input',()=>{activeKey=null;resetPage();});status.addEventListener('change',()=>{activeKey=null;assessment?.clearFilter();resetPage();});
 mode.addEventListener('change',()=>{activeGroup=null;activeKey=null;resetPage();});pageSize.addEventListener('change',resetPage);
 document.getElementById('clear-group').addEventListener('click',()=>{activeGroup=null;activeKey=null;resetPage();});
 document.getElementById('previous-page').addEventListener('click',()=>{page--;render();document.getElementById('review-workspace').scrollIntoView({block:'start'});});

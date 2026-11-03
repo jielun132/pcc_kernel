@@ -12,7 +12,7 @@ from typing import Any
 
 CONTRACT_VERSION = "1"
 VERSIONS = dict(contract_version="1", ir_version="1", normalizer_version="2",
-                matcher_version="3", diff_version="2", guard_version="3", materials_version="1", rules_version="1")
+                matcher_version="3", diff_version="2", guard_version="3", materials_version="1", rules_version="1", assessment_version="3")
 METRICS = ("execution_count", "total_latency", "average_latency", "total_keys", "average_keys")
 
 

@@ -2,7 +2,7 @@
 
 **把同一批 SQL 放到升级前、升级后的 TiDB 中，比较执行计划，并生成 HTML 报告。**
 
-当前版本：**0.1.4** · [下载与所有版本](https://github.com/jielun132/pcc_kernel/releases) · [更新记录](CHANGELOG.md)
+当前版本：**0.1.5** · [下载与所有版本](https://github.com/jielun132/pcc_kernel/releases) · [更新记录](CHANGELOG.md)
 
 下面按一个完整 Demo 走四步。准备三套相互独立的 TiDB：`prod` 模拟生产环境，`old` 模拟升级前，`new` 模拟升级后。PCC 只对待比较 SQL 执行普通 `EXPLAIN`，不会执行业务 DML。
 
@@ -10,12 +10,14 @@
 
 在能连接三套 TiDB 的 **Linux x86_64** 机器上执行，使用 Bash。原生包自带 Python；运行机需要 glibc 2.28 或以上，导入步骤另需 MySQL 8 客户端。
 
-安装包和校验文件见 [v0.1.4 Release](https://github.com/jielun132/pcc_kernel/releases/tag/v0.1.4)；从源码开发请参考[本地开发说明](CONTRIBUTING.md#本地开发)。
+安装包和校验文件见 [v0.1.5 Release](https://github.com/jielun132/pcc_kernel/releases/tag/v0.1.5)；从源码开发请参考[本地开发说明](CONTRIBUTING.md#本地开发)。
 
 ```bash
-curl -fLO https://github.com/jielun132/pcc_kernel/releases/download/v0.1.4/pcc-core-0.1.4-linux-x86_64.tar.gz
-tar -xzf pcc-core-0.1.4-linux-x86_64.tar.gz
-cd pcc-core-0.1.4-linux-x86_64
+curl -fLO https://github.com/jielun132/pcc_kernel/releases/download/v0.1.5/pcc-core-0.1.5-linux-x86_64.tar.gz
+curl -fLO https://github.com/jielun132/pcc_kernel/releases/download/v0.1.5/pcc-core-0.1.5-linux-x86_64.tar.gz.sha256
+sha256sum -c pcc-core-0.1.5-linux-x86_64.tar.gz.sha256
+tar -xzf pcc-core-0.1.5-linux-x86_64.tar.gz
+cd pcc-core-0.1.5-linux-x86_64
 ./pcc --version
 cp examples/profiles.demo.json profiles.json
 vi profiles.json
@@ -97,6 +99,7 @@ unset PCC_DB_PASSWORD MYSQL_PWD
 
 - 按“执行计划一致 / 存在差异 / 无法比对”分别统计和筛选，无法比对项直接说明原因。
 - 展示差异类型、命中规则及归并事实，估算行数单列；两端计划对齐并保留字段证据。
+- 0.1.5 新增 49 张可勾选规则卡：27 类支持有条件自动预判，22 类提供复核依据。点击“按所选规则重新判断”，将全部差异 SQL 分为变优、变差、基本等价、待复核；支持完整计划组合判断，公开命中证据和综合工作量模型，支持 JSON/CSV 导出。详见[规则预判说明](docs/rule-assessment.md)。
 - 相似差异可集中查看，仍需 DBA 逐条评审，不自动批量通过或继承结论。
 - SQL 目录支持分页、搜索和按编号跳转；可按数据库或两侧完整计划结构分组。本次暂不审核的库可隐藏并恢复，原始统计不变，也不计为通过。
 - 长计划保留层级缩进、固定列头和框内滚动；旧计划、新计划或两侧文本均可一键复制。
@@ -106,7 +109,9 @@ unset PCC_DB_PASSWORD MYSQL_PWD
 
 ## 版本、限制和开发
 
-这是早期版本，尚不支持所有 SQL 场景。0.1.4 的本地 Docker 验证共 413 条 SQL：200 条一致、197 条有差异、16 条无法比对。后者包含 11 条预期拦截和 5 条未解决问题；分区统计回放、长 Prepared EXPLAIN 等限制见[验证说明](docs/validation.md)。
+这是早期版本，尚不支持所有 SQL 场景。0.1.5 本地 Docker 重测共 413 条 SQL：200 条一致、197 条有差异、16 条无法比对。默认及全选规则均为 **85 变优、0 变差、111 基本等价、1 待复核**；待复核从 132 条降至 1 条。21 条采用明确标记的工作量估算模型，未测量实际耗时；剩余 CAST 类型长度变化保留语义复核。无法比对中仍包含 11 条预期拦截和 5 条未解决问题；分区统计回放、长 Prepared EXPLAIN 等限制见[验证说明](docs/validation.md)。
+
+另已修正聚合 COUNT 规则并复测两个版本的真实计划定向验收：4 变优、4 变差、2 待复核、2 一致。新增 44 组真实升级计划夹具及反向检查。NTH_PLAN 同版本对照与归档反向检查独立验证判断器，不计入自然升级结果，也不构成性能基准或所有版本认证。
 
 开发中的回归案例集中在 [固定 SQL 用例库](tests/cases/README.md)：413 条、17 类，历史用例只允许追加，CI 校验历史内容。报告交互测试还覆盖 1,053 条 SQL 的分页与分组，需要本机 Node.js；程序运行本身不依赖 Node.js。本地 Docker v6.5.12 / v8.5.5 的用例验证不替代客户版本认证。
 
