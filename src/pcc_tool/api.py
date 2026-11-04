@@ -2,17 +2,22 @@
 from __future__ import annotations
 
 import dataclasses
+import heapq
 import platform
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable
 
-from pcc_tool.artifacts.store import (Publication, load_bundle, read_json, read_jsonl, safe_path,
+from pcc_tool.artifacts.captures import SavedPlans, retryable_stats
+from pcc_tool.artifacts.store import (Publication, iter_jsonl, load_bundle, read_json, read_jsonl, safe_path,
                                      source_lock, verify, write_bytes, write_json, write_jsonl)
 from pcc_tool.capture.connection import Database, profile_named
-from pcc_tool.capture.explain import capture_plan, negotiate_format
+from pcc_tool.capture.scheduling import WaitingQueries, query_tables
+from pcc_tool.capture.explain import CaptureGuard, capture_plan, negotiate_format
 from pcc_tool.collector.dependencies import binding_evidence, export_dependencies, qualified, verify_materials, verify_tiflash
 from pcc_tool.collector.legacy import read_tsv
 from pcc_tool.collector.source import read_repository, read_summary
@@ -44,7 +49,16 @@ def _query_file(path: str, allowed):
         rows = read_jsonl(file)
         queries = []
         for i, row in enumerate(rows, 1):
-            q = make_query(row.get("sql_text"), row.get("schema", ""), {"file": file.name, "row": i},
+            origin = {"file": file.name, "row": i}
+            labels = row.get("origin", {})
+            if not isinstance(labels, dict):
+                raise PCCError("SQL_FILE_INVALID", "SQL 样例的 origin 必须是对象")
+            for key in ("case_id", "case_name", "category"):
+                if key in labels:
+                    if not isinstance(labels[key], str) or len(labels[key]) > 256:
+                        raise PCCError("SQL_FILE_INVALID", "案例标签必须是至多 256 字符的字符串")
+                    origin[key] = labels[key]
+            q = make_query(row.get("sql_text"), row.get("schema", ""), origin,
                            row.get("context", {}), allowed, row.get("truncated", False), parameters=row.get("parameters"))
             for key in ("source_digest", "source_cluster"):
                 value = row.get(key, "")
@@ -297,6 +311,8 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, asses
             events, item["compare_status"], item["issues"], assessment_schema,
             {side: snapshots.get((q.query_id, side)) for side in ("old", "new")})
         item["assessment"] = evaluate(item["assessment_evidence"])
+        if item["assessment_evidence"]["mandatory_reviews"]:
+            item["requires_review"] = True
         items.append(item)
     counts = {status: sum(i["compare_status"] == status for i in items) for status in ("same", "changed", "incomparable", "not_run")}
     selected = len(queries)
@@ -318,6 +334,16 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, asses
                    auxiliary_findings=sum(f["confirmed"] and f["kind"] == "auxiliary" for f in findings))
     summary["assessment"] = {key: sum(i["assessment"]["status"] == key for i in items)
                              for key in ("better", "worse", "equivalent", "review", "excluded")}
+    summary["data_review"] = {key: sum(i["compare_status"] == key and bool(i["assessment_evidence"]["mandatory_reviews"])
+                                       for i in items) for key in ("same", "changed", "incomparable")}
+    basis = dict(plan_evaluation=0, model_only=0, missing_definition=0, unresolved_difference=0)
+    for item in items:
+        if item["assessment"]["status"] == "review":
+            ids = {r["rule_id"] for r in item["assessment_evidence"]["mandatory_reviews"]}
+            reason = ("plan_evaluation" if ids & {"D01", "D02"} else "missing_definition" if "D10" in ids
+                      else "model_only" if "D08" in ids else "unresolved_difference")
+            basis[reason] += 1
+    summary["review_basis"] = basis
     status = "interrupted" if interrupted else "blocked" if not selected else "partial" if full != selected else "completed"
     if not selected:
         issues = [*issues, {"code": "NO_QUERIES_SELECTED"}]
@@ -349,7 +375,7 @@ def _write_result(root, result, bundle, snapshots, irs, events, assessment_schem
     write_jsonl(root / "inputs/issues.jsonl", bundle.issues)
     write_json(root / "inputs/assessment_schema.json", assessment_schema or {})
     for side in ("old", "new"):
-        write_jsonl(root / f"plans/{side}.jsonl", [snapshots[q.query_id, side] for q in bundle.queries if (q.query_id, side) in snapshots])
+        write_jsonl(root / f"plans/{side}.jsonl", (snapshots[q.query_id, side] for q in bundle.queries if (q.query_id, side) in snapshots))
         write_jsonl(root / f"ir/{side}.jsonl", [irs[q.query_id, side] for q in bundle.queries if (q.query_id, side) in irs])
     write_jsonl(root / "events.jsonl", events.rows)
     render_reports(root, result, bundle.queries, snapshots, irs, bundle.selection, bundle.context)
@@ -358,6 +384,145 @@ def _write_result(root, result, bundle, snapshots, irs, events, assessment_schem
 def _bundle_business(bundle):
     return business_value({"queries": bundle.queries, "context": bundle.context, "selection": bundle.selection,
                            "objects": bundle.manifest.get("objects", []), "databases": bundle.manifest.get("databases", [])})
+
+
+@dataclasses.dataclass
+class _PlanAttempt:
+    query: QueryCase
+    side: str
+    number: int
+    started: float = dataclasses.field(default_factory=time.monotonic)
+    phase: tuple[str, float] = dataclasses.field(default_factory=lambda: ("guard", time.monotonic()))
+
+    def set_stage(self, stage):
+        self.phase = (stage, time.monotonic())
+
+
+PROGRESS_INTERVAL = 5
+SLOW_EXPLAIN_SECONDS = 5
+
+
+def _stats_retry_delay(attempt):
+    return min(attempt, 3)
+
+
+def _capture_plans(queries, snapshots, targets, fmt, request, cancel, events, objects=()):
+    sides = ("old", "new")
+    by_id = {q.query_id: q for q in queries}
+    tables = query_tables(queries, objects) if request.concurrency > 1 else {}
+    work = {side: WaitingQueries(tables, (q for q in queries if (q.query_id, side) not in snapshots
+                                         and (q.query_id, side) not in snapshots.deferred)) for side in sides}
+    ready = {side: WaitingQueries(tables) for side in sides}
+    retries = {side: [] for side in sides}
+    completed = Counter(side for _, side in snapshots)
+    limit = request.concurrency
+    guard = CaptureGuard()
+    started = time.monotonic()
+    next_update = started
+    total = len(queries) * len(sides)
+    futures = {}
+
+    def enqueue_retry(qid, side):
+        delay = _stats_retry_delay(len(snapshots.deferred[qid, side]))
+        heapq.heappush(retries[side], (time.monotonic() + delay, qid))
+
+    for qid, side in snapshots.deferred:
+        enqueue_retry(qid, side)
+
+    def progress(clock):
+        active = []
+        for side in sides:
+            # Futures keep submission order. Show the longest waiting case on each side.
+            for job in futures.values():
+                if job.side == side:
+                    case = next((o["case_id"] for o in job.query.sample_origins if o.get("case_id")), "")
+                    stage, since = job.phase
+                    active.append(dict(side=side, case_id=case, query_id=job.query.query_id,
+                                       attempt=job.number, stage=stage, seconds=int(clock - job.started),
+                                       stage_seconds=max(0, int(clock - since))))
+                    break
+        events.emit("capture_progress", completed=len(snapshots), total=total, elapsed_seconds=int(clock - started),
+                    active=active, cancelling=cancel.is_set(), per_side_total=len(queries),
+                    completed_by_side={s: completed[s] for s in sides},
+                    running_by_side={s: sum(j.side == s for j in futures.values()) for s in sides},
+                    side_limit=limit,
+                    retry_queue={s: len(retries[s]) + len(ready[s]) for s in sides})
+
+    def next_query(side, running, clock):
+        busy, slow = set(), set()
+        for job in running:
+            deps = tables.get(job.query.query_id, ())
+            busy.update(deps)
+            stage, since = job.phase
+            if stage == "cancel_wait" or (stage == "explain" and clock - since >= SLOW_EXPLAIN_SECONDS):
+                slow.update(deps)
+        if slow:
+            other = work[side].take(slow) or ready[side].take(slow)
+            if other is not None:
+                return other
+        # Fill every free slot immediately, even if only one table remains.
+        return work[side].take(busy) or work[side].take() or ready[side].take(busy) or ready[side].take()
+
+    with ThreadPoolExecutor(max_workers=limit * len(sides)) as pool:
+        while True:
+            for side in sides:
+                running = [job for job in futures.values() if job.side == side]
+                clock = time.monotonic()
+                while retries[side] and retries[side][0][0] <= clock:
+                    _, qid = heapq.heappop(retries[side])
+                    ready[side].add(by_id[qid])
+                while len(running) < limit and not cancel.is_set():
+                    q = next_query(side, running, clock)
+                    if q is None:
+                        break
+                    job = _PlanAttempt(q, side, len(snapshots.deferred.get((q.query_id, side), ())) + 1)
+                    # One attempt per connection. Backoff never holds a worker or a SQL session.
+                    future = pool.submit(capture_plan, q, side, targets[side], format=fmt, session=request.session,
+                                         timeout_seconds=request.timeout_seconds, stats_retries=0,
+                                         binding_policy=request.binding_policy, cancel=cancel, guard=guard, on_stage=job.set_stage)
+                    futures[future] = job
+                    running.append(job)
+            clock = time.monotonic()
+            finished = not futures and (cancel.is_set() or not (any(work.values()) or any(ready.values()) or any(retries.values())))
+            if finished or clock >= next_update:
+                progress(clock)
+                next_update = clock + PROGRESS_INTERVAL
+            if finished:
+                return
+            if not futures:
+                wake = min(queue[0][0] for queue in retries.values() if queue)
+                cancel.wait(max(0, min(wake, next_update) - clock))
+                continue
+            done, _ = wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
+            for future in done:
+                job = futures.pop(future)
+                q, side = job.query, job.side
+                try:
+                    snapshot = future.result()
+                except MemoryError:
+                    cancel.set()
+                    raise PCCError("CAPTURE_MEMORY_LIMIT", "PCC 内存分配失败，已落盘的计划可复用。将 workflow.concurrency 设为 1 后选 4 继续。") from None
+                except Exception:
+                    snapshot = PlanSnapshot(q.query_id, side, capture_status="failed", issues=[{"code": "CAPTURE_INTERNAL_ERROR"}])
+                if job.number <= request.stats_retries and retryable_stats(snapshot):
+                    snapshots.defer(snapshot)
+                    enqueue_retry(q.query_id, side)
+                    events.emit("stats_retry_deferred", query_id=q.query_id, side=side, attempt=job.number)
+                    continue
+                snapshots.finish(snapshot)
+                completed[side] += 1
+                events.emit("plan_captured", query_id=q.query_id, side=side, capture_status=snapshot.capture_status,
+                            cancellation=snapshot.cancellation)
+
+
+def _check_both(targets, events, stage, check):
+    # Each cluster has one read-only connection; publish results in old/new order.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {}
+        for side, profile in targets.items():
+            events.emit("compare_stage", stage=stage, side=side)
+            futures[side] = pool.submit(check, side, profile)
+        return {side: future.result() for side, future in futures.items()}
 
 
 def compare(request: CompareRequest, *, profiles=None, on_event=None, cancel=None) -> ComparisonResult:
@@ -376,109 +541,89 @@ def compare(request: CompareRequest, *, profiles=None, on_event=None, cancel=Non
     endpoints = [(p["host"], int(p.get("port", 4000))) for p in target_profiles.values()]
     if endpoints[0] == endpoints[1]:
         raise PCCError("TARGET_NOT_ISOLATED", "old 和 new 不能是同一个 SQL 端点")
-    target_info, pre_issues, before, supported = {}, list(bundle.issues), {}, {}
-    for side, profile in target_profiles.items():
+
+    def precheck(side, profile):
         with Database(profile, request.timeout_seconds) as db:
             version = db.version()
-            supported[side] = negotiate_format(db)
-            before[side], material_issues = verify_materials(db, bundle.manifest)
-            target_info[side] = {"version": version, "session": db.variables(), "materials": before[side],
-                                 "endpoint": {"host": profile["host"], "port": profile.get("port", 4000)}}
-            pre_issues.extend({**i, "side": side} for i in material_issues)
-            target_info[side]["tiflash"], flash_issues = verify_tiflash(db, bundle.context.get("tiflash"))
-            pre_issues.extend({**i, "side": side} for i in flash_issues)
+            formats = negotiate_format(db)
+            materials, issues = verify_materials(db, bundle.manifest)
+            info = {"version": version, "session": db.variables(), "materials": materials,
+                    "endpoint": {"host": profile["host"], "port": profile.get("port", 4000)}}
+            info["tiflash"], flash_issues = verify_tiflash(db, bundle.context.get("tiflash"))
+            issues = [*issues, *flash_issues]
             if request.binding_policy == "preserve":
-                bindings = binding_evidence(db.records("SHOW GLOBAL BINDINGS"))
-                target_info[side]["bindings"] = bindings
-                if bindings != bundle.context.get("bindings"):
-                    pre_issues.append({"code": "BINDINGS_MISMATCH", "side": side})
+                info["bindings"] = binding_evidence(db.records("SHOW GLOBAL BINDINGS"))
+                if info["bindings"] != bundle.context.get("bindings"):
+                    issues.append({"code": "BINDINGS_MISMATCH"})
+            return formats, info, issues
+
+    target_info, pre_issues, supported = {}, list(bundle.issues), {}
+    for side, (formats, info, issues) in _check_both(target_profiles, events, "precheck", precheck).items():
+        supported[side], target_info[side] = formats, info
+        pre_issues.extend({**i, "side": side} for i in issues)
     common = [fmt for fmt in ("tidb_json", "row") if all(fmt in supported[s] for s in supported)]
     if not common:
         raise PCCError("PLAN_FORMAT_UNSUPPORTED", "两端没有共同支持的计划格式")
-    fingerprint = digest(business_value({"bundle": _bundle_business(bundle), "targets": target_info,
+    inputs = business_value({"bundle": _bundle_business(bundle), "targets": target_info,
         "session": request.session, "profile_sessions": {s: p.get("session", {}) for s, p in target_profiles.items()},
         "binding_policy": request.binding_policy, "versions": VERSIONS, "format": common[0],
-        "timeout_seconds": request.timeout_seconds, "stats_retries": request.stats_retries}))
+        "timeout_seconds": request.timeout_seconds, "stats_retries": request.stats_retries})
+    fingerprint = digest(inputs)
+    # v5 and v6 change assessment only. v3 did not archive the projection session variable.
+    compatible = ()
+    if request.resume and VERSIONS["assessment_version"] == "6":
+        legacy_targets = {s: {**info, "session": {k: v for k, v in info["session"].items()
+                                                  if k != "tidb_opt_projection_push_down"}}
+                          for s, info in inputs["targets"].items()}
+        compatible = tuple(digest({**inputs, "targets": targets, "versions": {**inputs["versions"], "assessment_version": version}})
+                           for version, targets in (("5", inputs["targets"]), ("4", inputs["targets"]), ("3", legacy_targets)))
     events.emit("compare_started", fingerprint=fingerprint, format=common[0], targets=target_info)
-    snapshots = {}
-    with Publication(request.out, fingerprint, request.resume) as publication:
+    with Publication(request.out, fingerprint, request.resume, compatible_fingerprints=compatible) as publication:
         root = publication.work
-        capture_dir = root / "captures"
-        capture_dir.mkdir(exist_ok=True)
+        snapshots = SavedPlans(root)
         query_ids = {q.query_id for q in bundle.queries}
         if request.resume:
-            for path in sorted(capture_dir.glob("*.json")):
-                raw = read_json(path)
-                if digest(raw) != path.name.rsplit(".", 2)[-2]:
-                    raise PCCError("HASH_MISMATCH", "原始计划检查点被修改")
-                snapshot = PlanSnapshot(**raw)
-                if snapshot.query_id not in query_ids or snapshot.side not in {"old", "new"}:
-                    raise PCCError("ARTIFACT_INVALID", "恢复计划不属于本次输入")
-                if snapshot.capture_status == "ok":
-                    snapshots[snapshot.query_id, snapshot.side] = snapshot
+            snapshots.restore(query_ids, request.stats_retries)
         for side in ("old", "new"):
             path = root / f"plans/{side}.jsonl"
             if request.resume and path.exists():
-                for raw in read_jsonl(path):
+                for raw in iter_jsonl(path):
                     snapshot = PlanSnapshot(**raw)
-                    if snapshot.capture_status == "ok":
-                        snapshots[(snapshot.query_id, side)] = snapshot
-        semaphores = {side: threading.Semaphore(request.concurrency) for side in ("old", "new")}
-
-        def capture(q, side):
-            with semaphores[side]:
-                return capture_plan(q, side, target_profiles[side], format=common[0], session=request.session,
-                                    timeout_seconds=request.timeout_seconds, stats_retries=request.stats_retries,
-                                    binding_policy=request.binding_policy, cancel=cancel)
-
-        with ThreadPoolExecutor(max_workers=request.concurrency * 2) as pool:
-            futures = {}
-            # Bounded queue: do not enqueue the whole workload before checking cancellation.
-            work = iter((q, s) for q in bundle.queries for s in ("old", "new") if (q.query_id, s) not in snapshots)
-            exhausted = False
-            while futures or not exhausted:
-                while not exhausted and not cancel.is_set() and len(futures) < request.concurrency * 2:
-                    try:
-                        q, side = next(work)
-                    except StopIteration:
-                        exhausted = True
-                        break
-                    future = pool.submit(capture, q, side)
-                    futures[future] = (q.query_id, side)
-                if cancel.is_set():
-                    exhausted = True
-                if not futures:
-                    break
-                from concurrent.futures import FIRST_COMPLETED, wait
-                done, _ = wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
-                for future in done:
-                    key = futures.pop(future)
-                    try:
-                        snapshot = future.result()
-                    except Exception:
-                        snapshot = PlanSnapshot(*key, capture_status="failed", issues=[{"code": "CAPTURE_INTERNAL_ERROR"}])
-                    snapshots[key] = snapshot
-                    events.emit("plan_captured", query_id=key[0], side=key[1], capture_status=snapshot.capture_status,
-                                cancellation=snapshot.cancellation)
-                    # Content-addressed snapshots survive abrupt process death without quadratic journal rewrites.
-                    write_json(capture_dir / f"{key[0]}.{key[1]}.{digest(snapshot)}.json", snapshot)
-        for side, profile in target_profiles.items():
+                    if snapshot.query_id not in query_ids or snapshot.side != side:
+                        raise PCCError("ARTIFACT_INVALID", "恢复计划不属于本次输入")
+                    if (snapshot.capture_status == "ok" and (snapshot.query_id, side) not in snapshots
+                            and (snapshot.query_id, side) not in snapshots.deferred):
+                        snapshots.save(snapshot)
+        _capture_plans(bundle.queries, snapshots, target_profiles, common[0], request, cancel, events,
+                       bundle.manifest.get("objects", ()))
+        if cancel.is_set():
+            pre_issues.extend({"code": "STATS_RETRY_PENDING", "query_id": qid, "side": side,
+                               "message": "已保存统计未就绪的观测，继续任务时复查该端"}
+                              for qid, side in snapshots.deferred)
+        def postcheck(side, profile):
+            issues = []
             try:
                 with Database(profile) as db:
                     after, material_issues = verify_materials(db, bundle.manifest)
-                    pre_issues.extend({**i, "side": side} for i in material_issues)
-                    if after != before[side] or db.version() != target_info[side]["version"]:
-                        pre_issues.append({"code": "ENVIRONMENT_DRIFT", "side": side})
+                    issues.extend(material_issues)
+                    if after != target_info[side]["materials"] or db.version() != target_info[side]["version"]:
+                        issues.append({"code": "ENVIRONMENT_DRIFT"})
                     flash, flash_issues = verify_tiflash(db, bundle.context.get("tiflash"))
-                    pre_issues.extend({**i, "side": side} for i in flash_issues)
+                    issues.extend(flash_issues)
                     if flash != target_info[side]["tiflash"]:
-                        pre_issues.append({"code": "ENVIRONMENT_DRIFT", "side": side})
+                        issues.append({"code": "ENVIRONMENT_DRIFT"})
                     if request.binding_policy == "preserve" and binding_evidence(db.records("SHOW GLOBAL BINDINGS")) != target_info[side]["bindings"]:
-                        pre_issues.append({"code": "BINDINGS_DRIFT", "side": side})
+                        issues.append({"code": "BINDINGS_DRIFT"})
             except PCCError as exc:
-                pre_issues.append({"code": "POSTCHECK_FAILED", "side": side, "cause": exc.code})
+                issues.append({"code": "POSTCHECK_FAILED", "cause": exc.code})
+            return issues
+
+        for side, issues in _check_both(target_profiles, events, "postcheck", postcheck).items():
+            pre_issues.extend({**i, "side": side} for i in issues)
+        events.emit("compare_stage", stage="diff")
         result, irs = _summarize(bundle.queries, snapshots, fingerprint, pre_issues, cancel.is_set(), assessment_schema)
         result.output_dir = str(publication.work if cancel.is_set() else publication.output)
+        events.emit("compare_stage", stage="write_report")
         events.emit("compare_completed", run_status=result.run_status, summary=result.summary, exit_code=result.exit_code)
         _write_result(root, result, bundle, snapshots, irs, events, assessment_schema)
         publication.checkpoint(run_status=result.run_status, completed=[list(k) for k in sorted(snapshots)])
@@ -510,6 +655,12 @@ def diff(request: DiffRequest, *, on_event=None, cancel=None) -> ComparisonResul
             snapshots[key] = snapshot
     schema_path = root / "inputs/assessment_schema.json"
     assessment_schema = read_json(schema_path) if schema_path.exists() else {}
+    # Older archives identify views but do not include their definitions.
+    for obj in bundle.manifest.get("objects", []):
+        if obj.get("kind") == "view" and "view_reviews" not in assessment_schema.get(obj["schema"] + "." + obj["table"], {}):
+            assessment_schema[obj["schema"] + "." + obj["table"]] = dict(
+                view_dependencies=obj.get("dependencies", []),
+                view_reviews=[["D10", "归档缺少视图定义，无法排除内部读表求值。"]])
     fingerprint = digest(business_value({"inputs": _bundle_business(bundle), "snapshots": [snapshots[k] for k in sorted(snapshots)],
                                          "versions": VERSIONS, "assessment_schema": assessment_schema}))
     events = Events(on_event)

@@ -1,0 +1,20 @@
+CREATE TABLE pcc_validation_20261011.matrix_types (
+  id BIGINT PRIMARY KEY,
+  tiny TINYINT, small SMALLINT, medium MEDIUMINT, signed_int INT,
+  signed_big BIGINT, unsigned_big BIGINT UNSIGNED,
+  f FLOAT, d DOUBLE, money DECIMAL(20,6), precise_value DECIMAL(65,30),
+  bits BIT(8), flag BOOLEAN,
+  fixed_char CHAR(16), text_value VARCHAR(255) COLLATE utf8mb4_bin,
+  ci_value VARCHAR(255) COLLATE utf8mb4_general_ci,
+  binary_value BINARY(8), varbinary_value VARBINARY(255),
+  tiny_text TINYTEXT, text_body TEXT, medium_text MEDIUMTEXT, long_text LONGTEXT,
+  tiny_blob TINYBLOB, blob_value BLOB, medium_blob MEDIUMBLOB, long_blob LONGBLOB,
+  day_value DATE, dt DATETIME(6), ts TIMESTAMP(6) NULL, duration TIME(6), yr YEAR,
+  enum_value ENUM('new','paid','closed'), set_value SET('a','b','c'), doc JSON,
+  generated_value INT AS (JSON_EXTRACT(doc,'$.n')) STORED,
+  virtual_value INT AS (signed_int + 1) VIRTUAL,
+  nullable_value INT NULL,
+  KEY idx_money(money), KEY idx_day(day_value), KEY idx_ci(ci_value),
+  KEY idx_text(text_value(32)), KEY idx_generated(generated_value),
+  KEY idx_composite(signed_int,money)
+) CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

@@ -11,7 +11,8 @@ from fractions import Fraction
 from pathlib import Path
 
 from pcc_tool.models import primitive
-from pcc_tool.plan.rule_catalog import ASSESSMENT_VERSION, DEFAULT_RULES, DEFAULT_THRESHOLDS, RULE_CATALOG
+from pcc_tool.plan.empty_replay import replay_reviews, review_reason, view_evidence
+from pcc_tool.plan.rule_catalog import ASSESSMENT_VERSION, DEFAULT_RULES, DEFAULT_THRESHOLDS, REQUIRED_DATA_RULES, RULE_CATALOG
 
 READERS = {"TableReader", "IndexReader"}
 COLUMN = r"(?:Column#\d+|[A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*){1,2})"
@@ -181,7 +182,11 @@ def guard_pass(guard, thresholds):
 def evaluate(evidence, selected=None, thresholds=None):
     selected = set(DEFAULT_RULES if selected is None else selected)
     thresholds = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
+    reviews = [*evidence.get("mandatory_reviews", []), *(r for r in evidence.get("runtime_notes", []) if r["rule_id"] in selected)]
+    mandatory = [r["rule_id"] + " · " + r["reason"] for r in reviews]
     if evidence["scope"] != "changed":
+        if mandatory:
+            return dict(status="review", matched=[], uncovered=[], reasons=mandatory + list(evidence["blockers"]))
         return dict(status="excluded", matched=[], uncovered=[], reasons=["只对已确认存在差异的 SQL 预判"])
     matched, rejected = [], []
     for match in evidence["matches"]:
@@ -195,7 +200,7 @@ def evaluate(evidence, selected=None, thresholds=None):
     covered = {str(ref) for m in matched for ref in m["event_refs"]}
     uncovered = [ref for ref in evidence["event_refs"] if str(ref) not in covered]
     directions = {m["direction"] for m in matched} - {"equivalent"}
-    reasons = list(evidence["blockers"]) + [reason for match, reason in rejected
+    reasons = mandatory + list(evidence["blockers"]) + [reason for match, reason in rejected
         if any(str(ref) not in covered for ref in match["event_refs"])]
     if uncovered:
         reasons.append("存在未被所选规则完整覆盖的差异")
@@ -211,11 +216,18 @@ def schema_evidence(bundle):
     from sqlglot import exp
     from pcc_tool.artifacts.store import safe_path
     result = {}
+    views = []
     if not bundle.path:
         return result
     for obj in bundle.manifest.get("objects", []):
         try:
+            if obj.get("kind") == "view":
+                result[obj["schema"] + "." + obj["table"]] = dict(view_reviews=[["D10", "缺少可读的视图定义。"]],
+                    view_dependencies=obj.get("dependencies", []))
             text = safe_path(Path(bundle.path), obj["ddl_file"]).read_text()
+            if obj.get("kind") == "view":
+                views.append((obj, text))
+                continue
             tree = sqlglot.parse_one(text, read="mysql")
             if not isinstance(tree, exp.Create) or not isinstance(tree.this, exp.Schema):
                 continue
@@ -229,6 +241,9 @@ def schema_evidence(bundle):
                 ddl_hash=obj.get("ddl_hash"))
         except (KeyError, ValueError, OSError, sqlglot.errors.ParseError):
             continue
+    for obj, text in views:
+        result[obj["schema"] + "." + obj["table"]] = dict(
+            view_reviews=view_evidence(text, obj["schema"], result), view_dependencies=obj.get("dependencies", []))
     return result
 
 
@@ -242,7 +257,8 @@ def query_table(query, metadata):
         if not isinstance(tree, exp.Select) or len(tables) != 1 or tree.args.get("joins") or tree.args.get("with_"):
             return None, None
         table = tables[0]
-        return tree, metadata.get((table.db or query.schema) + "." + table.name)
+        entry = metadata.get((table.db or query.schema) + "." + table.name)
+        return tree, entry if entry and "columns" in entry else None
     except (ValueError, sqlglot.errors.ParseError):
         return None, None
 
@@ -270,15 +286,22 @@ def false_query(query):
 
 def detect(query, old, new, events, status, issues=(), metadata=None, captures=None):
     evidence = dict(version=ASSESSMENT_VERSION, scope=status, event_refs=[str(i) for i in range(1, len(events) + 1)],
-                    matches=[], hints=[], blockers=[], cautions=[])
+                    matches=[], hints=[], blockers=[], cautions=[], mandatory_reviews=[], runtime_notes=[])
+    if status == "not_run":
+        return evidence
+    nodes = {side: [n for root in ir.roots for n in walk(root)] if ir else []
+             for side, ir in (("old", old), ("new", new))}
+    for review in replay_reviews(query, nodes, metadata or {}):
+        field = "mandatory_reviews" if review["rule_id"] in REQUIRED_DATA_RULES else "runtime_notes"
+        evidence[field].append(review)
     if status != "changed" or not old or not new:
         return evidence
     if old.parse_status != "ok" or new.parse_status != "ok" or any(e.requires_review for e in events):
         evidence["blockers"].append("计划解析或节点对应不完整")
     if any(i.get("code") == "CONTEXT_DIFFERENCE" for i in issues):
         evidence["cautions"].append("两端存在非阻断的上下文差异；本结论只评估所见计划，不能直接归因于版本。")
-    old_nodes = {n.node_id: n for root in old.roots for n in walk(root)}
-    new_nodes = {n.node_id: n for root in new.roots for n in walk(root)}
+    old_nodes = {n.node_id: n for n in nodes["old"]}
+    new_nodes = {n.node_id: n for n in nodes["new"]}
     tree, table_meta = query_table(query, metadata or {})
     known_stats = bool(table_meta and table_meta["stats_ready"])
     no_pseudo = all("stats:pseudo" not in n.attributes and "stats:partial" not in n.attributes for n in [*old_nodes.values(), *new_nodes.values()])
@@ -405,11 +428,14 @@ def detect(query, old, new, events, status, issues=(), metadata=None, captures=N
                 event_refs=evidence["event_refs"], requires_rules=required))
         if any(step["rule_id"] == "E09" for step in proof):
             evidence["cautions"].append("计划包含未初始化列统计的诊断变化；已核验物理执行差异，统计质量问题仍需关注。")
-    elif not evidence["blockers"]:
+    elif not evidence["blockers"] and (not evidence["matches"] or
+            evaluate({**evidence, "mandatory_reviews": []})["status"] == "review"):
         from pcc_tool.plan.assessment_cost import estimate_tradeoff
         estimate = estimate_tradeoff(query, old, new, metadata or {}, captures or {})
         if estimate:
             evidence["matches"].append(dict(estimate, id=f"m{len(evidence['matches']) + 1}", event_refs=evidence["event_refs"]))
+            evidence["mandatory_reviews"].append(review_reason("D08",
+                "A22 的扫描、回表、传输与内存分数来自估算。真实的匹配率、中间行数与资源占用可改变收益方向。"))
     changed_nodes = [n for event in events for n in (old_nodes.get(event.old_node), new_nodes.get(event.new_node)) if n]
     operators = {n.operator for n in changed_nodes}
     for rule in RULE_CATALOG:

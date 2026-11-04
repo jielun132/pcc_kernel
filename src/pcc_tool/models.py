@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import Any
 
 CONTRACT_VERSION = "1"
+DEFAULT_CONCURRENCY = 8
 VERSIONS = dict(contract_version="1", ir_version="1", normalizer_version="2",
-                matcher_version="3", diff_version="2", guard_version="3", materials_version="1", rules_version="1", assessment_version="3")
+                matcher_version="3", diff_version="2", guard_version="3", materials_version="1", rules_version="1", assessment_version="6")
 METRICS = ("execution_count", "total_latency", "average_latency", "total_keys", "average_keys")
 
 
@@ -30,7 +31,7 @@ def now() -> str:
 
 def primitive(value: Any) -> Any:
     if dataclasses.is_dataclass(value):
-        return primitive(dataclasses.asdict(value))
+        return {field.name: primitive(getattr(value, field.name)) for field in dataclasses.fields(value)}
     if isinstance(value, dict):
         return {str(k): primitive(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -211,7 +212,7 @@ class CompareRequest:
     new: str
     out: str
     resume: bool = False
-    concurrency: int = 2
+    concurrency: int = DEFAULT_CONCURRENCY
     timeout_seconds: int = 30
     stats_retries: int = 1
     binding_policy: str = "exclude"

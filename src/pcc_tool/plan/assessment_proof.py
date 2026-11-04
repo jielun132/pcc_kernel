@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 import re
 
-from pcc_tool.plan.assessment import COLUMN, READERS, alias_only, attrs, limits, number, same, split_list, walk
+from pcc_tool.plan.assessment import COLUMN, READERS, alias_only, attrs, limits, number, safe_filter, same, split_list, walk
 
 
 def pure_columns(text):
@@ -26,8 +26,10 @@ def version_pair(captures):
 
 
 def version_verified(captures):
-    # Source-verified representations, not an open-ended >= version assumption.
-    return set(version_pair(captures)) == {"v6.5.12", "v8.5.5"}
+    # Keep release identities distinct. These three upgrade pairs have captured
+    # controls for the plan shapes below; individual formatting rules are narrower.
+    old, new = version_pair(captures)
+    return "v6.5.12" in (old, new) and bool({old, new} & {"v8.5.5", "v8.5.7", "v7.1.9-0.3"})
 
 
 def column_type(column, metadata):
@@ -182,8 +184,8 @@ def prove_plans(query, old, new, metadata, captures):
         encoded = "".join(r"\x00" + c for c in value)
         old_info = f'range:["{value}","{value}"], keep order:false'
         new_info = f'range:["{encoded}","{encoded}"], keep order:false'
-        return ((a.attributes, b.attributes) == (old_info, new_info) and versions == ("v6.5.12", "v8.5.5")
-                or (b.attributes, a.attributes) == (old_info, new_info) and versions == ("v8.5.5", "v6.5.12"))
+        return ((a.attributes, b.attributes) == (old_info, new_info) and versions[0] == "v6.5.12"
+                or (b.attributes, a.attributes) == (old_info, new_info) and versions[1] == "v6.5.12")
 
     def long_constant_display(a, b):
         import json
@@ -210,8 +212,43 @@ def prove_plans(query, old, new, metadata, captures):
         column = f"{tables[0].db or query.schema}.{tables[0].name}.{condition.this.name}"
         full = f"eq({column}, {json.dumps(value, ensure_ascii=False)})"
         short = f"eq({column}, {json.dumps(prefix + '...(len:' + str(len(raw)) + ')', ensure_ascii=False)})"
-        return ((a.attributes, b.attributes) == (full, short) and versions == ("v6.5.12", "v8.5.5")
-                or (b.attributes, a.attributes) == (full, short) and versions == ("v8.5.5", "v6.5.12"))
+        return ((a.attributes, b.attributes) == (full, short) and versions[1] in {"v8.5.5", "v8.5.7"}
+                or (b.attributes, a.attributes) == (full, short) and versions[0] in {"v8.5.5", "v8.5.7"})
+
+    def fixed_access_estimate(a, b, na, nb, child_proofs):
+        # Require an observed unchanged access below the changed estimate.
+        if a.operator in {"IndexRangeScan", "TableRangeScan"} and not a.children and a.task == "cop[tikv]":
+            access = re.fullmatch(r"table:([\w$]+)(?:, index:[\w$]+\(([\w$, ]+)\))?", a.access)
+            if not access or a.attributes != b.attributes:
+                return False
+            info = metadata.get(aliases.get(access[1]), {})
+            keys = access[2].split(", ") if access[2] else info.get("primary_key", [])
+            if not keys or not info.get("stats_ready") or (not access[2] and not info.get("clustered_pk")):
+                return False
+            if not all(re.fullmatch(r"(?:BIGINT|INT|SMALLINT|MEDIUMINT|TINYINT|DECIMAL)(?:\([\d, ]+\))?(?: UNSIGNED)?",
+                                    info["columns"].get(k, "")) for k in keys):
+                return False
+            value = r"(?:-?\d+(?:\.\d+)?|[+-]inf)"
+            endpoint = " ".join([value] * len(keys))
+            return (re.fullmatch(r"range:[\[(]" + endpoint + "," + endpoint + r"[\])], keep order:(?:true|false)", a.attributes)
+                    and min(na, nb) > 0 and max(na, nb) <= min(na, nb) * number("1.10"))
+        if a.operator == "Selection" and len(a.children) == 1 and a.task == "cop[tikv]":
+            scan = a.children[0]
+            table = re.fullmatch(r"table:([\w$]+)", scan.access)
+            info = metadata.get(aliases.get(table[1]), {}) if table else {}
+            # Same deterministic filter after the exact same full scan. No
+            # estimate-dependent operator lies between that scan and filter.
+            return (scan.operator == "TableFullScan" and scan.attributes == "keep order:false"
+                    and info.get("stats_ready") and same(scan, b.children[0]) and safe_filter(a.attributes, info)
+                    and a.attributes == b.attributes and number(scan.estimate) is not None
+                    and 0 <= min(na, nb) <= max(na, nb) <= number(scan.estimate))
+        if not any(p["rule_id"] == "E16" for p in child_proofs):
+            return False
+        if a.operator == "Projection" and not (pure_columns(a.attributes) and pure_columns(b.attributes)):
+            return False
+        if a.operator in READERS | {"Projection"} and len(a.children) == 1:
+            return na == number(a.children[0].estimate) and nb == number(b.children[0].estimate)
+        return False
 
     def compare(a, b):
         if same(a, b):
@@ -220,7 +257,7 @@ def prove_plans(query, old, new, metadata, captures):
         # pure-column pushdown only when colRefCount < inputSchemaLen.
         for left, right, side, direction in ((a, b, 1, "better"), (b, a, 0, "worse")):
             if (left.operator == "Projection" and left.task == "root" and pure_columns(left.attributes)
-                    and len(left.children) == 1 and versions[side] == "v8.5.5"):
+                    and len(left.children) == 1 and versions[side] in {"v8.5.5", "v8.5.7"}):
                 reader = left.children[0]
                 if (reader.operator in READERS and reader.task == "root" and len(reader.children) == 1
                         and reader.children[0].task == "cop[tikv]" and right.operator == reader.operator
@@ -234,7 +271,7 @@ def prove_plans(query, old, new, metadata, captures):
                     outer.role, moved.role = moved.role, outer.role
                     proof = compare(outer, right) if direction == "better" else compare(right, outer)
                     if proof is not None:
-                        return [step("A07", a, b, "相同纯列投影移过 Reader 边界，其余子树逐项核验；v8.5.5 源码限定输出列数小于输入列数，减少传输列。小输入收益可能很小。" if direction == "better" else
+                        return [step("A07", a, b, f"相同纯列投影移过 Reader 边界，其余子树逐项核验。{versions[side]} 对纯列裁剪要求输出列数小于输入列数，减少传输列。小输入收益可能很小。" if direction == "better" else
                                      "相同纯列裁剪从 TiKV 移回 root；其余子树逐项核验，跨 Reader 传输列增加。", direction)] + proof
 
         # The ordered union of equality-prefix indexes emits clustered handles
@@ -260,6 +297,20 @@ def prove_plans(query, old, new, metadata, captures):
                                 return [step("A10", a, b, "聚簇主键顺序由等值索引前缀和有序 IndexMerge 保证；相同 offset/count 内嵌，省去额外 TopN。" if direction == "better" else "反向增加相同主键顺序上的 TopN。", direction)] + proof
 
         if verified:
+            if {a.operator, b.operator} == {"HashAgg", "StreamAgg"} and a.attributes.startswith("group by:"):
+                def empty_input(n):
+                    if len(n.children) != 1:
+                        return False
+                    source = n.children[0]
+                    if source.operator == "Projection" and len(source.children) == 1:
+                        source = source.children[0]
+                    return source.operator == "TableDual" and source.attributes == "rows:0" and not source.children
+                if empty_input(a) and empty_input(b) and a.task == b.task == "root":
+                    aligned = copy.copy(b)
+                    aligned.operator = a.operator
+                    proof = compare(a, aligned)
+                    if proof is not None:
+                        return [step("E17", a, b, "两端分组输入都是 rows:0 的 TableDual，核对了分组键、聚合输出和投影列。两种聚合均无需处理输入行。")] + proof
             mapped = aggregate_lineage(a, b)
             if mapped and (a.attributes != mapped[0].attributes or b.attributes != mapped[1].attributes):
                 proof = compare(*mapped)
@@ -319,7 +370,7 @@ def prove_plans(query, old, new, metadata, captures):
             elif a.operator == "IndexRangeScan" and collation_display(a, b):
                 rule, reason = "E12", "SQL 显式使用 utf8mb4_general_ci；ASCII 等值端点逐字核对为相同 UTF-16 大写权重键，索引列、开闭边界和顺序不变。"
             elif a.operator == "Selection" and long_constant_display(a, b):
-                rule, reason = "E14", "完整绑定字符串与旧计划逐字相符；新计划严格符合 v8.5.5 的前 64 字节和完整 UTF-8 字节长度缩略规则。不是仅比较相同前缀。"
+                rule, reason = "E14", "完整绑定字符串与未缩略的计划逐字相符，另一端精确显示前 64 字节和原 UTF-8 字节总数。"
             elif a.operator in {"TableFullScan", "TableRangeScan", "IndexFullScan", "IndexRangeScan"} and re.sub(r", stats:partial\[[A-Za-z_][\w$]*:unInitialized(?:, [A-Za-z_][\w$]*:unInitialized)*\]$", "", aa) == re.sub(r", stats:partial\[[A-Za-z_][\w$]*:unInitialized(?:, [A-Za-z_][\w$]*:unInitialized)*\]$", "", bb):
                 rule, reason = "E09", "仅统计诊断字段变化，实际访问路径、范围、估算和执行位置不变。警告：仍存在未初始化的列统计，不代表统计质量已改善。"
             elif a.operator in {"HashJoin", "MergeJoin"} and numeric_equality(aa, metadata) is not None and numeric_equality(aa, metadata) == numeric_equality(bb, metadata):
@@ -367,9 +418,12 @@ def prove_plans(query, old, new, metadata, captures):
                 if input_a is not None and input_b is not None and na <= input_a and nb <= input_b:
                     proofs.append(step("E09", a, b, "相同物理扫描和谓词上，未初始化列统计诊断伴随估算口径变化；保留原始估算和统计警告，不据此推断实际扫描量。"))
                     return proofs + child_proofs
+            if not floor and fixed_access_estimate(a, b, na, nb, child_proofs):
+                proofs.append(step("E16", a, b, f"两端的静态数值扫描范围或全扫描后的整数过滤相同。仅输出估算及其透传变化 {a.estimate} → {b.estimate}，保留两端估算。"))
+                return proofs + child_proofs
             if not floor:
                 return None
-            proofs.append(step("E11", a, b, f"物理结构与表达式已另行完整核对；v6.5.12 / v8.5.5 的小于一行估算下限及传播变化：{a.estimate} → {b.estimate}。这不表示实测出现/消失数据。"))
+            proofs.append(step("E11", a, b, f"物理结构与表达式已另行完整核对。{versions[0]} / {versions[1]} 的亚一行估算及其传播为 {a.estimate} → {b.estimate}。"))
         return proofs + child_proofs
 
     result = []

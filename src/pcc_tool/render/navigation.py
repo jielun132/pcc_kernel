@@ -1,5 +1,6 @@
 """Offline report browsing. Group membership is never an approval decision."""
 import json
+from itertools import chain
 
 from pcc_tool.models import canonical, digest
 
@@ -55,17 +56,21 @@ def plan_copy_text(snapshot, ir):
 
 
 def navigation_markup(records):
-    # Escape script end tags even inside JSON strings. No user value is inserted as HTML by JS.
-    payload = json.dumps(records, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-    initial = records[0]["html"] if records else ""
-    return '''<div class="review-layout" id="review-workspace">
+    return "".join(navigation_chunks(records))
+
+
+def navigation_chunks(records):
+    records = iter(records)
+    first = next(records, None)
+    initial = first["html"] if first is not None else ""
+    yield '''<div class="review-layout" id="review-workspace">
 <aside class="sql-sidebar" aria-label="SQL 浏览目录">
   <div class="sidebar-heading"><h2>SQL 目录</h2><span id="visible-count" aria-live="polite"></span></div>
   <div class="filters"><input id="search" type="search" aria-label="搜索 SQL、对象或标识" placeholder="搜索 SQL、表名…"></div>
   <div class="sidebar-tools"><label class="sr-only" for="group-mode">分组方式</label><select id="group-mode"><option value="all">全部 SQL</option><option value="schema">按数据库</option><option value="plan">按相似计划</option></select><button id="clear-group" type="button" hidden>退出分组</button></div>
   <p id="group-help" class="sidebar-note"></p><div id="group-list"></div>
   <details class="scope-settings"><summary>筛选与范围</summary>
-    <label for="status">比较状态</label><select id="status"><option value="" selected>全部状态</option><option value="changed">存在差异</option><option value="same">执行计划一致</option><option value="unavailable">无法比对</option><option value="attention">差异与无法比对</option><option value="incomparable">比较未完成</option><option value="not_run">未运行</option><option value="needs_sample">缺少样例</option></select>
+    <label for="status">比较状态</label><select id="status"><option value="" selected>全部状态</option><option value="changed">存在差异</option><option value="same">执行计划一致</option><option value="unavailable">无法比对</option><option value="attention">需关注（差异、无法比对、待复核）</option><option value="incomparable">比较未完成</option><option value="not_run">未运行</option><option value="needs_sample">缺少样例</option></select>
     <h3>本次暂不审核</h3><p class="sidebar-note">勾选库后隐藏，不计为通过；刷新后恢复。</p><div id="schema-scope"></div>
     <details><summary>分组口径</summary><p class="sidebar-note">按默认数据库归类，跨库依赖仍保留。相似计划按 old / new 两棵有序树的算子、角色、任务和引擎归类，忽略表名、谓词与估算值；各条 SQL 仍需独立评审。</p></details>
   </details>
@@ -76,9 +81,16 @@ def navigation_markup(records):
 <label class="sr-only" for="page-size">目录每页条数</label><select id="page-size"><option value="10">10 条 / 页</option><option value="20">20 条 / 页</option><option value="50">50 条 / 页</option></select></div>
 </aside><section class="sql-results" aria-label="SQL 比较结果">
 <div class="focus-toolbar"><span id="detail-position" aria-live="polite"></span><div><button type="button" id="previous-query">← 上一条</button><button type="button" id="next-query">下一条 →</button></div></div>
-<div id="sql-cards">''' + initial + '''</div><div id="empty" class="empty" role="status"''' + (' hidden' if records else '') + '''>没有符合当前筛选条件的 SQL。</div>
+<div id="sql-cards">''' + initial + '''</div><div id="empty" class="empty" role="status"''' + (' hidden' if first is not None else '') + '''>没有符合当前筛选条件的 SQL。</div>
 <noscript>启用 JavaScript 可切换 SQL、分组和复制计划。此处仅展示首条 SQL，完整数据在 differences.csv 中。</noscript>
-</section></div><script type="application/json" id="report-data">''' + payload + '</script>'
+</section></div><script type="application/json" id="report-data">['''
+    if first is not None:
+        for index, record in enumerate(chain((first,), records)):
+            if index:
+                yield ","
+            # User text must never terminate the inline JSON script.
+            yield json.dumps(record, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    yield "]</script>"
 
 
 NAV_STYLES = '''
@@ -106,9 +118,9 @@ const skipped=new Set();
 const labels={same:'一致',changed:'有差异',incomparable:'无法比对',not_run:'无法比对'};
 function element(tag,text,className){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el;}
 const assessment=typeof PCCAssessment==='undefined'?null:PCCAssessment.attach(records,clearView=>{
-  if(clearView){activeGroup=null;activeKey=null;search.value='';status.value='changed';skipped.clear();}resetPage();
+  if(clearView){activeGroup=null;activeKey=null;search.value='';status.value='';skipped.clear();}resetPage();
 });
-function statusMatch(r){const s=status.value;return s==='attention'?r.attention:s==='needs_sample'?r.needsSample:s==='unavailable'?r.category==='unavailable':!s||r.status===s;}
+function statusMatch(r){const s=status.value;return s==='attention'?r.attention||assessment?.status(r)==='review':s==='needs_sample'?r.needsSample:s==='unavailable'?r.category==='unavailable':!s||r.status===s;}
 function baseMatch(r){return (!assessment||assessment.matches(r))&&!skipped.has(r.schema)&&statusMatch(r)&&r.search.includes(search.value.trim().toLowerCase());}
 function groupValue(r){return mode.value==='schema'?r.schema:r.planGroup;}
 function buildGroups(){
@@ -141,7 +153,7 @@ function render(){
     const heading=element('span',undefined,'nav-item-heading');heading.append(element('strong',`#${String(r.number).padStart(3,'0')}`),element('small',labels[r.status]));
     const schema=element('span',r.schema||'未指定库','nav-schema');schema.setAttribute('title',r.schema||'未指定库');
     a.append(heading,element('span',r.preview,'nav-preview'),schema);
-    if(assessment&&r.status==='changed')a.append(element('span',assessment.label(r),'nav-assessment assessment-'+assessment.status(r)));
+    if(assessment&&assessment.status(r)!=='excluded')a.append(element('span',assessment.label(r),'nav-assessment assessment-'+assessment.status(r)));
     nav.append(a);
   });
   document.getElementById('page-state').textContent=`${page+1} / ${pages}`;

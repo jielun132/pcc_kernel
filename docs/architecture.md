@@ -18,6 +18,8 @@ flowchart LR
 
 CLI 和 Python SDK 调用同一份核心。collector 负责 Summary、累计合并、筛选及依赖；capture 负责连接、SQL 守卫、EXPLAIN、取消和材料核验；plan 负责解析、匹配与差异；artifacts 负责文件发布、校验和与恢复；render 生成自包含 HTML 和 CSV。模块导入不连接数据库。
 
+0.1.6 增加 `interactive.py` 编排上述公开 API；任务记录保存配置指纹、已导入目标和报告检查点，不保存密码。`workflow.py` 只在交互确认后调用 MySQL 客户端导入；`demo.py` 离线生成合成数据及完整案例输入，固定案例副本与原始用例库逐字校验。原有 CLI/SDK 调用路径不自动导入，也不要求交互终端。
+
 运行时为 CPython 3.11、PyMySQL 和 SQLGlot。SQLGlot 用于验证和依赖识别，不重写待测 SQL。工具不依赖平台服务、AI、Go、Docker 或任务队列。
 
 ## SQL 与参数
@@ -58,6 +60,8 @@ CaptureBundle 保存原 SQL、参数、来源、排名、SHOW CREATE DATABASE/TA
 
 prepare 只生成导入及核验材料。两端必须使用同一来源包、同名对象和相同源统计。compare 前后检查结构、统计与上下文；LOAD STATS 返回成功、两端 EXPLAIN 成功，都不自动证明统计完整或生产复现可信。
 
+每端优先调度尚未尝试的样例。仅有统计未就绪问题的观测写入 `stats-retries/`，退避期间释放连接及并发名额；复查使用新连接，重新设置会话并重新绑定 Prepared 参数。最终计划保留历次返回的行、告警及复查连接上下文。节点、版本或会话上下文变化会标记 `CONTEXT_DRIFT`。已完成的原始计划仍写入 `captures/`，断点分别校验两类记录，复用有效计划和已用重试次数。
+
 worker 独占连接，在同一连接执行 USE、白名单会话设置、普通 EXPLAIN 和紧随的 SHOW WARNINGS。SQL 与 Status 端点须核对同源。原始结果先保存，row 和 tidb_json 进入同一 IR。
 
 归一化只消除临时算子 ID、数字表示等已确认的噪声。FullScan / RangeScan、PointGet / BatchPointGet、索引、范围、分区、Join 顺序与 Build/Probe 角色保留。未知属性保留原文，匹配有歧义时不任意配对。估算变化和 cost 不是性能倍率。
@@ -77,6 +81,8 @@ row/JSON 的列名别名和数值表示进入同一 IR；目前没有跨版本�
 - 相似分组仅包含可完整比较的计划事实，按类别、规则及旧新算子结构（含任务、引擎、角色）归类，不用表名、谓词或估算值决定相似。保留成员及各自对象，`review_status=pending_review`、`automatic_approval=false`；不自动批准或继承其他 SQL 的结论。
 
 0.1.5 在事实层之上增加 `plan/assessment.py` 与 `plan/rule_catalog.py`，版本记录为 `assessment_version=3`。它们保留候选命中和差异覆盖证据，按用户选中的规则与阈值独立给出 better / worse / equivalent / review；一致和无法比对项为 excluded。`assessment_proof.py` 验证完整计划的组合变换并记录 `requires_rules`；`assessment_cost.py` 对支持的复杂取舍使用同一工作量模型，归档分量、权重及假设，明确标记估算而非实测。未知或不可靠输入拒绝分类；只有全部差异被覆盖且无冲突才分类，原始事实、比较状态及退出码不变。浏览器使用相同证据重算，阈值比较采用整数分数；规则范围和归档字段见[规则预判说明](rule-assessment.md)。
+
+0.1.6 使用 `assessment_version=6`。规则判断区分默认必审与运行时提示。D01/D02、D08、D10 保留会影响结论的缺口，D03–D07、D09、D11–D13 记录供实测核对的信息。原始 plan、比较状态、差异事件和退出码独立保存，已有 v3–v5 采集检查点仍按原输入指纹及文件哈希验证。
 
 ## 状态与产物
 

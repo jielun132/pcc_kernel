@@ -2,7 +2,6 @@
 import logging
 import re
 
-import sqlglot
 from sqlglot import exp
 from sqlglot.dialects.mysql import MySQL
 from sqlglot.errors import ErrorLevel, SqlglotError
@@ -107,14 +106,17 @@ def guard_sql(sql: str | None, allowed=("select", "update", "delete"), *, parame
     if re.match(r"\s*(?:EXECUTE|PREPARE)\b", sql, re.I):
         raise PCCError("NEEDS_EXECUTABLE_SAMPLE", "Prepared SQL 需要完整参数样例")
     try:
-        tokens = sqlglot.tokenize(validation_sql, read="mysql")
+        dialect = TiDBValidation()
+        tokens = dialect.tokenize(validation_sql)
         if tokens and tokens[0].text.upper() in {"PREPARE", "EXECUTE"}:
             raise PCCError("NEEDS_EXECUTABLE_SAMPLE", "Prepared SQL 需要 SQL 模板和完整参数样例")
         replace = bool(tokens and tokens[0].text.upper() == "REPLACE")
         if replace:
             token = tokens[0]
             validation_sql = validation_sql[:token.start] + "INSERT" + validation_sql[token.end + 1:]
-        statements = sqlglot.parse(validation_sql, read=TiDBValidation, error_level=ErrorLevel.RAISE)
+            tokens = dialect.tokenize(validation_sql)
+        statements = dialect.parser(error_level=ErrorLevel.RAISE).parse(tokens, validation_sql)
+        del tokens
     except (SqlglotError, RecursionError):
         raise PCCError("SQL_UNSUPPORTED", "SQL 解析失败，可能已截断或语法尚不支持") from None
     statements = [s for s in statements if s is not None and not isinstance(s, exp.Semicolon)]
@@ -182,7 +184,7 @@ def quote_identifier(value: str) -> str:
 
 def validate_session(values: dict) -> dict:
     boolean = {"tidb_enable_index_merge", "tidb_allow_mpp", "tidb_enforce_mpp",
-               "tidb_enable_chunk_rpc", "tidb_enable_cascades_planner"}
+               "tidb_enable_chunk_rpc", "tidb_enable_cascades_planner", "tidb_opt_projection_push_down"}
     integers = {"tidb_stats_load_sync_wait": (0, 30000), "tidb_cost_model_version": (1, 2)}
     result = {}
     for key, value in values.items():

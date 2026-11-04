@@ -43,6 +43,7 @@ def test_thousand_sqls_mount_one_detail_and_metadata_cannot_end_script():
     records = [dict(id=f'query-{i}', html=f'<article id="query-{i}"></article>',
                     preview='</script><img src=x onerror=alert(1)>') for i in range(1,1001)]
     text = navigation_markup(records)
+    assert '<option value="attention">需关注（差异、无法比对、待复核）</option>' in text
     assert text.count('<article ') == 1
     assert '<img' not in text
     payload = re.search(r'<script type="application/json" id="report-data">(.*?)</script>', text, re.S).group(1)

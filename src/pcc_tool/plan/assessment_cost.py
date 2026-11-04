@@ -15,7 +15,8 @@ from collections import Counter
 import sqlglot
 from sqlglot import exp
 
-from pcc_tool.plan.assessment import COLUMN, limits, number, split_list, walk
+from pcc_tool.plan.assessment import COLUMN, alias_only, limits, number, same, split_list, walk
+from pcc_tool.plan.assessment_proof import version_pair, version_verified
 
 WEIGHTS = {"scan_bytes": 1, "lookup_bytes": 4, "network_bytes": 0.5, "cpu_units": 8, "memory_bytes": 0.1}
 LABELS = {"scan_bytes": "扫描字节估算", "lookup_bytes": "回表字节估算", "network_bytes": "传输字节估算",
@@ -23,7 +24,7 @@ LABELS = {"scan_bytes": "扫描字节估算", "lookup_bytes": "回表字节估�
 ALLOWED = {"TableFullScan", "TableRangeScan", "IndexFullScan", "IndexRangeScan", "TableRowIDScan", "Point_Get",
            "TableReader", "IndexReader", "IndexLookUp", "IndexMerge", "Projection", "Selection", "Limit", "TopN", "Sort",
            "HashJoin", "IndexJoin", "IndexHashJoin", "IndexMergeJoin", "MergeJoin", "HashAgg", "StreamAgg",
-           "Shuffle", "ShuffleReceiver", "Window", "Union", "TableDual", "Update", "Delete"}
+           "Shuffle", "ShuffleReceiver", "Window", "OrderedWindow", "Union", "TableDual", "Update", "Delete"}
 SCANS = {"TableFullScan", "TableRangeScan", "IndexFullScan", "IndexRangeScan", "TableRowIDScan", "Point_Get"}
 JOINS = {"HashJoin", "IndexJoin", "IndexHashJoin", "IndexMergeJoin", "MergeJoin"}
 EXPRESSIONS = {"eq", "ne", "lt", "le", "gt", "ge", "and", "or", "not", "isnull", "nulleq", "cast", "decimal", "var_string",
@@ -66,10 +67,70 @@ def schema_tables(query, metadata):
     return result or None
 
 
+def ordered_row_number(old, new):
+    if len(old.roots) != 1 or len(new.roots) != 1:
+        return False
+    a, b = old.roots[0], new.roots[0]
+    if (a.operator != b.operator or a.operator != "Projection" or not alias_only(a, b)
+            or (a.task, a.engine, a.access, a.role, a.estimate) != (b.task, b.engine, b.access, b.role, b.estimate)
+            or len(a.children) != 1 or len(b.children) != 1):
+        return False
+    a, b = a.children[0], b.children[0]
+    signature = r"row_number\(\)->Column#\d+ over\(partition by " + COLUMN + " order by " + COLUMN + r" rows between current row and current row\)"
+    if ({a.operator, b.operator} != {"OrderedWindow", "Window"} or a.task != b.task or a.task != "root"
+            or (a.engine, a.access, a.role, a.estimate, a.attributes) != (b.engine, b.access, b.role, b.estimate, b.attributes)
+            or not re.fullmatch(signature, a.attributes) or len(a.children) != 1 or len(b.children) != 1
+            or not same(a.children[0], b.children[0])):
+        return False
+    reader = a.children[0]
+    if reader.operator != "IndexReader" or len(reader.children) != 1:
+        return False
+    scan = reader.children[0]
+    if scan.operator == "Selection" and len(scan.children) == 1:
+        scan = scan.children[0]
+    return scan.operator in {"IndexFullScan", "IndexRangeScan"} and scan.attributes.endswith("keep order:true")
+
+
+def ordered_limit_ranges(top, limited, tables):
+    """Return the ordered scan and its number of equal-prefix ranges, if proven."""
+    if len(top.roots) != 1 or len(limited.roots) != 1:
+        return None
+    first, second = top.roots[0], limited.roots[0]
+    if first.operator != "TopN" or second.operator != "Limit" or len(first.children) != 1 or len(second.children) != 1:
+        return None
+    x, y = first.children[0], second.children[0]
+    if x.operator != y.operator or x.operator != "IndexReader" or len(x.children) != 1 or len(y.children) != 1:
+        return None
+    scan, local = x.children[0], y.children[0]
+    if local.operator != "Limit" or len(local.children) != 1:
+        return None
+    ordered = local.children[0]
+    left, right, pushed = limits(first), limits(second), limits(local)
+    if not (left and right and pushed and right[0] == "" and left[1:] == right[1:] and right[2] > 0
+            and pushed == ("", 0, right[1] + right[2]) and scan.operator == ordered.operator == "IndexRangeScan"
+            and scan.access == ordered.access and first.task == second.task == x.task == y.task == "root"
+            and local.task == scan.task == ordered.task == "cop[tikv]" and scan.attributes.endswith(", keep order:false")
+            and ordered.attributes == scan.attributes.removesuffix("false") + "true"):
+        return None
+    access = re.fullmatch(r"table:([\w$]+), index:[\w$]+\(([\w$]+)\)", scan.access)
+    key = left[0].split(".")
+    info = tables.get(access[1], {}) if access else {}
+    if (not info.get("clustered_pk") or len(key) != 3 or info.get("primary_key") != key[2:]
+            or tables.get(key[1]) != info or not re.fullmatch(r"(?:BIGINT|INT|SMALLINT|MEDIUMINT|TINYINT)(?:\(\d+\))?(?: UNSIGNED)?",
+                                                               info["columns"].get(access[2], ""))):
+        return None
+    ranges = scan.attributes.removeprefix("range:").removesuffix(", keep order:false").split(", ")
+    if not all(re.fullmatch(r"\[(-?\d+),\1\]", span) for span in ranges):
+        return None
+    return ordered.node_id, len(ranges)
+
+
 def tradeoff(old, new):
     def shape(node):
         return node.operator, node.access, node.role, tuple(shape(c) for c in node.children)
     a, b = [n for r in old.roots for n in walk(r)], [n for r in new.roots for n in walk(r)]
+    if any(n.operator == "OrderedWindow" for n in a + b):
+        return ordered_row_number(old, new)
     leaves = lambda nodes: [(n.operator, n.access) for n in nodes if n.operator in SCANS]
     if leaves(a) != leaves(b):
         return True
@@ -84,7 +145,7 @@ def tradeoff(old, new):
     return bool(counts_a["Limit"] and counts_b["Limit"] and counts_a["Limit"] != counts_b["Limit"])
 
 
-def workload(plan, tables):
+def workload(plan, tables, ordered_ranges=None):
     units = dict.fromkeys(WEIGHTS, 0.0)
     assumptions = set()
 
@@ -93,12 +154,12 @@ def workload(plan, tables):
             raise ValueError("unsupported operator or engine")
         if "stats:pseudo" in n.attributes or "stats:partial" in n.attributes:
             raise ValueError("unreliable statistics")
-        if n.operator in {"Projection", "Selection", "HashAgg", "StreamAgg", "Window"}:
+        if n.operator in {"Projection", "Selection", "HashAgg", "StreamAgg", "Window", "OrderedWindow"}:
             functions = {name.lower() for name in re.findall(r"\b([A-Za-z_][\w]*)\(", n.attributes)}
             if not functions <= EXPRESSIONS or "distinct" in n.attributes.lower():
                 raise ValueError("unsupported expression work")
         unary = {"TableReader", "IndexReader", "Projection", "Selection", "Limit", "TopN", "Sort", "HashAgg", "StreamAgg",
-                 "Shuffle", "ShuffleReceiver", "Window", "Update", "Delete"}
+                 "Shuffle", "ShuffleReceiver", "Window", "OrderedWindow", "Update", "Delete"}
         if (n.operator in SCANS | {"TableDual"} and n.children or n.operator in unary and len(n.children) != 1
                 or n.operator in JOINS | {"IndexLookUp"} and len(n.children) != 2
                 or n.operator in {"IndexMerge", "Union"} and len(n.children) < 2):
@@ -130,6 +191,11 @@ def workload(plan, tables):
                 raise ValueError("unbounded column width")
             width = 8 + sum(sizes) + len(sizes)  # row/handle + nullable slots
             units["lookup_bytes" if n.operator in {"TableRowIDScan", "Point_Get"} else "scan_bytes"] += rows * width
+            if ordered_ranges and n.node_id == ordered_ranges[0]:
+                streams = ordered_ranges[1]
+                units["cpu_units"] += rows * math.log2(streams)
+                units["memory_bytes"] += streams * width
+                assumptions.add(f"对 {streams} 段等值索引的保序归并，计入每行 log2({streams}) 次比较及每段一个行头的内存。")
         elif n.operator in {"TableReader", "IndexReader", "IndexLookUp", "IndexMerge"}:
             # Both the handle phase and row phase of a double read transfer
             # data; child estRows is TOTAL inner-side rows since TiDB 6.4.
@@ -191,8 +257,10 @@ def workload(plan, tables):
         elif n.operator in {"HashAgg", "StreamAgg"}:
             units["cpu_units"] += input_rows * max(1, n.attributes.count("funcs:")) * (2 if n.operator == "HashAgg" else 1)
             units["memory_bytes"] += rows * width if n.operator == "HashAgg" else width
-        elif n.operator == "Window":
+        elif n.operator in {"Window", "OrderedWindow"}:
             units["cpu_units"] += input_rows * max(1, n.attributes.count("->"))
+            if n.operator == "OrderedWindow":
+                assumptions.add("相同有序输入的 ROW_NUMBER 按每行一次计算计分。模型未估算两个窗口实现的内部缓冲和启动开销。")
         elif n.operator == "Shuffle":
             concurrency = re.search(r"concurrency:(\d+)", n.attributes)
             if not concurrency:
@@ -218,8 +286,14 @@ def workload(plan, tables):
 def estimate_tradeoff(query, old, new, metadata, captures):
     if not old or not new or old.parse_status != "ok" or new.parse_status != "ok":
         return None
-    versions = {getattr(captures.get(side), "version", "") for side in ("old", "new")}
-    if not versions <= {"v6.5.12", "v8.5.5"} or not tradeoff(old, new):
+    versions = set(version_pair(captures))
+    if not (versions <= {"v6.5.12", "v8.5.5"} or versions == {"v8.5.7"} or version_verified(captures)):
+        return None
+    tables = schema_tables(query, metadata)
+    if not tables:
+        return None
+    ordered = (ordered_limit_ranges(new, old, tables), ordered_limit_ranges(old, new, tables))
+    if not any(ordered) and not tradeoff(old, new):
         return None
     # A parameterized scan can change displayed selectivity conventions while
     # its enclosing lookup stays the same. Do not score such a change as I/O.
@@ -231,10 +305,7 @@ def estimate_tradeoff(query, old, new, metadata, captures):
         a, b = da[key], db[key]
         if a is None or b is None or max(a, b) > max(1, min(a, b)) * number("1.2"):
             return None
-    tables = schema_tables(query, metadata)
-    if not tables:
-        return None
-    workloads = [workload(plan, tables) for plan in (old, new)]
+    workloads = [workload(plan, tables, ranges) for plan, ranges in zip((old, new), ordered)]
     if any(value is None for value in workloads):
         return None
     scores = [sum(w["units"][key] * value for key, value in WEIGHTS.items()) for w in workloads]
@@ -250,7 +321,7 @@ def estimate_tradeoff(query, old, new, metadata, captures):
         value["units"] = {key: f"{amount:.4f}" for key, amount in value["units"].items()}
     return dict(rule_id="A22", direction=direction, guards=[], basis="estimated_work",
         old_nodes=[r.node_id for r in old.roots], new_nodes=[r.node_id for r in new.roots],
-        reason=f"PCC 工作量模型 v1：旧计划 {scores[0]:.2f} 分，新计划 {scores[1]:.2f} 分（新/旧 {ratio:.3f}）；同一模型按 max/min ≤ 1.20 视为基本等价。依据扫描、回表、传输、CPU 和内存估算综合判断。分数不是 TiDB estCost，也不是实测耗时；数据倾斜、缓存及并发可能改变实际方向。",
-        model=dict(version="1", tolerance_ratio="1.2", weights={k: str(v) for k, v in WEIGHTS.items()}, labels=LABELS, old=workloads[0], new=workloads[1],
+        reason=f"PCC 工作量模型 v2 估算旧计划 {scores[0]:.2f} 分，新计划 {scores[1]:.2f} 分（新/旧 {ratio:.3f}）。两端使用相同的扫描、回表、传输、CPU 和内存权重，max/min ≤ 1.20 判为基本等价。数据倾斜、缓存及并发会影响实测耗时。",
+        model=dict(version="2", tolerance_ratio="1.2", weights={k: str(v) for k, v in WEIGHTS.items()}, labels=LABELS, old=workloads[0], new=workloads[1],
                    old_score=serialized_scores[0], new_score=serialized_scores[1],
                    assumptions=["列宽使用 DDL 有界最大宽度；无界类型不自动评分。", "模型衡量总工作量，不预测墙钟时间、溢出或数据倾斜。", "回表权重 4、传输权重 0.5、CPU 权重 8、内存权重 0.1 是 PCC 策略，并非 TiDB 官方常数。", "两端子节点 estRows 使用同一总量口径；小于一行按一行计。"] ))

@@ -94,7 +94,9 @@ def test_partial_failures_and_repeated_material_checks_replay_identically(tmp_pa
         assert {i["code"] for i in item["issues"]} == {"STATS_NOT_READY","DB_QUERY_FAILED"}
 
 
-def test_interrupt_and_resume(tmp_path, monkeypatch, online):
+@pytest.mark.parametrize("prior_assessment", ["3", "4", "5", "6"])
+@pytest.mark.parametrize("resumed_concurrency", [1, 8])
+def test_interrupt_and_resume(tmp_path, monkeypatch, online, prior_assessment, resumed_concurrency):
     bundle, profiles, calls, capture = online
     cancel = threading.Event()
     def interrupting(q, side, profile, **kwargs):
@@ -103,11 +105,13 @@ def test_interrupt_and_resume(tmp_path, monkeypatch, online):
         return result
     monkeypatch.setattr(api, "capture_plan", interrupting)
     output = str(tmp_path / "result")
-    interrupted = api.compare(CompareRequest(bundle.path, "old", "new", output, concurrency=1), profiles=profiles, cancel=cancel)
+    with monkeypatch.context() as old_build:
+        old_build.setattr(api, "VERSIONS", {**api.VERSIONS, "assessment_version": prior_assessment})
+        interrupted = api.compare(CompareRequest(bundle.path, "old", "new", output, concurrency=1), profiles=profiles, cancel=cancel)
     assert interrupted.exit_code == 4 and not (tmp_path / "result").exists()
     assert verify(tmp_path / ".result.partial")["run_status"] == "interrupted"
     monkeypatch.setattr(api, "capture_plan", capture)
-    resumed = api.compare(CompareRequest(bundle.path, "old", "new", output, resume=True, concurrency=1), profiles=profiles)
+    resumed = api.compare(CompareRequest(bundle.path, "old", "new", output, resume=True, concurrency=resumed_concurrency), profiles=profiles)
     assert resumed.exit_code == 0
     assert len(calls) == len(set(calls)) == 8
 
@@ -144,3 +148,171 @@ def test_target_must_be_isolated(tmp_path, online):
     with pytest.raises(PCCError) as err:
         api.compare(CompareRequest(bundle.path, "old", "new", str(tmp_path / "result")), profiles=profiles)
     assert err.value.code == "TARGET_NOT_ISOLATED"
+
+
+def test_slow_old_does_not_block_new_and_progress_identifies_pending_query(tmp_path, monkeypatch, online):
+    bundle, profiles, _, capture = online
+    release = threading.Event()
+    news, progress = [], []
+    def uneven(q, side, profile, **kwargs):
+        if side == "old":
+            assert release.wait(4)
+        return capture(q, side, profile, **kwargs)
+    def event(e):
+        if e["event"] == "plan_captured" and e["side"] == "new":
+            news.append(e["query_id"])
+        if e["event"] == "capture_progress":
+            progress.append(e)
+            if len(news) == 4 and e["active"] and e["completed"] == "4":
+                release.set()
+    monkeypatch.setattr(api, "capture_plan", uneven)
+    monkeypatch.setattr(api, "PROGRESS_INTERVAL", 0.01)
+    result = api.compare(CompareRequest(bundle.path, "old", "new", str(tmp_path / "progress"), concurrency=1),
+                         profiles=profiles, on_event=event)
+    assert result.exit_code == 0 and len(news) == 4
+    assert progress[-1]["completed"] == progress[-1]["total"] == "8"
+    stalled = next(e for e in progress if e["completed"] == "4")
+    assert [a["query_id"] for a in stalled["active"]] == [bundle.queries[0].query_id]
+
+
+def test_worker_memory_error_keeps_partial_comparison_resumable(tmp_path, monkeypatch, online):
+    bundle, profiles, _, capture = online
+    out = str(tmp_path / "limited")
+    req = CompareRequest(bundle.path, "old", "new", out, concurrency=1)
+    def limited(q, side, profile, **kwargs):
+        if q.query_id == bundle.queries[-1].query_id:
+            raise MemoryError()
+        return capture(q, side, profile, **kwargs)
+    monkeypatch.setattr(api, "capture_plan", limited)
+    with pytest.raises(PCCError) as err:
+        api.compare(req, profiles=profiles)
+    assert err.value.code == "CAPTURE_MEMORY_LIMIT"
+    saved = list((tmp_path / ".limited.partial" / "captures").glob("*.json"))
+    assert saved
+    monkeypatch.setattr(api, "capture_plan", capture)
+    result = api.compare(CompareRequest(bundle.path, "old", "new", out, resume=True, concurrency=1), profiles=profiles)
+    assert result.exit_code == 0
+
+
+def _observed(snapshot, stale, conn):
+    snapshot.context = {"connection_id": str(conn), "session": {"time_zone": "+08:00"},
+                        "declared_session": {"tidb_stats_load_sync_wait": 10000}, "server_node": [{"hostname": "n1"}]}
+    snapshot.warnings = [{"Code": "1105", "Message": "sync load stats timeout"}] if stale else []
+    snapshot.attempts = [{"attempt": 1, "columns": snapshot.columns, "rows": snapshot.rows, "warnings": snapshot.warnings}]
+    if stale:
+        snapshot.issues = [{"code": "STATS_NOT_READY"}]
+    return snapshot
+
+
+def test_cold_plans_yield_slots_and_only_the_affected_side_is_retried(tmp_path, monkeypatch, online):
+    bundle, profiles, calls, capture = online
+    ids = [q.query_id for q in bundle.queries]
+    events = []
+    def cold(q, side, profile, **options):
+        assert options["stats_retries"] == 0
+        snapshot = capture(q, side, profile, **options)
+        count = calls.count((q.query_id, side))
+        return _observed(snapshot, side == "old" and q.query_id == ids[0] and count == 1, count)
+    monkeypatch.setattr(api, "capture_plan", cold)
+    monkeypatch.setattr(api, "_stats_retry_delay", lambda n: 0)
+    req = CompareRequest(bundle.path, "old", "new", str(tmp_path / "cold"), concurrency=1, stats_retries=5)
+    result = api.compare(req, profiles=profiles, on_event=events.append)
+    assert result.exit_code == 0
+    assert [qid for qid, side in calls if side == "old"] == ids + [ids[0]]
+    assert [qid for qid, side in calls if side == "new"] == ids
+    assert sum(e["event"] == "plan_captured" for e in events) == 8
+    assert [e["attempt"] for e in events if e["event"] == "stats_retry_deferred"] == ["1"]
+    assert [e["completed_by_side"] for e in events if e["event"] == "capture_progress"][-1] == {"old": "4", "new": "4"}
+    plan = next(map(json.loads, (tmp_path / "cold/plans/old.jsonl").read_text().splitlines()))
+    assert [a["attempt"] for a in plan["attempts"]] == ["1", "2"]
+    assert [a["context"]["connection_id"] for a in plan["attempts"]] == ["1", "2"]
+    assert plan["attempts"][0]["warnings"] and not plan["warnings"]
+    offline = api.diff(DiffRequest(result.output_dir, str(tmp_path / "offline-cold")))
+    assert offline.items == result.items and offline.summary == result.summary
+
+
+def test_material_checks_overlap_across_targets_and_finish_before_capture(tmp_path, monkeypatch, online):
+    bundle, profiles, _, capture = online
+    rendezvous = threading.Barrier(2, timeout=3)
+    checks = {"old": 0, "new": 0}
+    def verify_both(db, manifest):
+        checks[db.profile["host"]] += 1
+        rendezvous.wait()
+        return {}, []
+    def capture_after_checks(q, side, profile, **kwargs):
+        assert checks == {"old": 1, "new": 1}
+        return capture(q, side, profile, **kwargs)
+    monkeypatch.setattr(api, "verify_materials", verify_both)
+    monkeypatch.setattr(api, "capture_plan", capture_after_checks)
+    result = api.compare(CompareRequest(bundle.path, "old", "new", str(tmp_path / "checked")), profiles=profiles)
+    assert result.exit_code == 0 and checks == {"old": 2, "new": 2}
+
+
+@pytest.mark.parametrize("budget", [0, 2])
+def test_persistent_pseudo_stays_incomparable_at_original_retry_budget(tmp_path, monkeypatch, online, budget):
+    bundle, profiles, calls, capture = online
+    key = (bundle.queries[0].query_id, "old")
+    def stale(q, side, profile, **options):
+        snap = capture(q, side, profile, **options)
+        return _observed(snap, (q.query_id, side) == key, calls.count((q.query_id, side)))
+    monkeypatch.setattr(api, "capture_plan", stale)
+    monkeypatch.setattr(api, "_stats_retry_delay", lambda n: 0)
+    result = api.compare(CompareRequest(bundle.path, "old", "new", str(tmp_path / "limit"), stats_retries=budget), profiles=profiles)
+    assert calls.count(key) == budget + 1
+    assert result.exit_code == 3 and result.summary["incomparable"] == "1"
+    assert any(i["code"] == "STATS_NOT_READY" and i["side"] == "old" for i in result.issues)
+    raw = next(map(json.loads, (tmp_path / "limit/plans/old.jsonl").read_text().splitlines()))
+    assert len(raw["attempts"]) == budget + 1 and all(a["warnings"] for a in raw["attempts"])
+
+
+@pytest.mark.parametrize("tamper", [False, True])
+def test_pending_stats_survive_interrupt_and_preserve_budget(tmp_path, monkeypatch, online, tamper):
+    bundle, profiles, calls, capture = online
+    key = (bundle.queries[0].query_id, "old")
+    cancel = threading.Event()
+    def stale(q, side, profile, **options):
+        snap = capture(q, side, profile, **options)
+        return _observed(snap, (q.query_id, side) == key, calls.count((q.query_id, side)))
+    def stop_when_saved(event):
+        if event["event"] == "stats_retry_deferred":
+            cancel.set()
+    monkeypatch.setattr(api, "capture_plan", stale)
+    monkeypatch.setattr(api, "_stats_retry_delay", lambda n: 0)
+    out = str(tmp_path / "resume-stats")
+    req = CompareRequest(bundle.path, "old", "new", out, stats_retries=2, concurrency=1)
+    result = api.compare(req, profiles=profiles, on_event=stop_when_saved, cancel=cancel)
+    assert result.exit_code == 4 and calls.count(key) == 1
+    assert any(i["code"] == "STATS_RETRY_PENDING" for i in result.issues)
+    partial = tmp_path / ".resume-stats.partial"
+    assert not list((partial / "captures").glob(key[0] + ".old.*"))
+    pending = next((partial / "stats-retries").glob("*.json"))
+    if tamper:
+        pending.write_bytes(pending.read_bytes().replace(b"sync load", b"modified"))
+        with pytest.raises(PCCError) as error:
+            api.compare(CompareRequest(bundle.path, "old", "new", out, stats_retries=2, resume=True), profiles=profiles)
+        assert error.value.code == "HASH_MISMATCH"
+        return
+    resumed = api.compare(CompareRequest(bundle.path, "old", "new", out, stats_retries=2, resume=True), profiles=profiles)
+    assert resumed.summary["incomparable"] == "1" and calls.count(key) == 3
+    assert calls.count((key[0], "new")) == 1
+    assert not any(i["code"] == "STATS_RETRY_PENDING" for i in resumed.issues)
+
+
+def test_retried_connection_cannot_hide_drift_or_retry_unrelated_errors(tmp_path, monkeypatch, online):
+    bundle, profiles, calls, capture = online
+    ids = [q.query_id for q in bundle.queries]
+    def changed(q, side, profile, **options):
+        snap = capture(q, side, profile, **options)
+        count = calls.count((q.query_id, side))
+        _observed(snap, side == "old" and q.query_id in ids[:2] and count == 1, count)
+        if side == "old" and q.query_id == ids[0] and count == 2:
+            snap.context["server_node"] = [{"hostname": "other"}]
+        if side == "old" and q.query_id == ids[1]:
+            snap.issues.append({"code": "CONTEXT_DRIFT"})
+        return snap
+    monkeypatch.setattr(api, "capture_plan", changed)
+    monkeypatch.setattr(api, "_stats_retry_delay", lambda n: 0)
+    result = api.compare(CompareRequest(bundle.path, "old", "new", str(tmp_path / "drift-retry")), profiles=profiles)
+    assert result.summary["incomparable"] == "2"
+    assert calls.count((ids[0], "old")) == 2 and calls.count((ids[1], "old")) == 1
+    assert all(any(i["code"] == "CONTEXT_DRIFT" for i in it["issues"]) for it in result.items[:2])

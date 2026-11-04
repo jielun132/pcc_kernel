@@ -17,6 +17,18 @@ from pcc_tool.render.assessment import ASSESSMENT_SCRIPT
 
 FIXTURE = json.loads((Path(__file__).parents[1] / 'fixtures/assessment_expansion.json').read_text())
 CASES = {c['name']: c for c in FIXTURE['cases']}
+# These real physical-plan proofs remain valid observations. Empty replay needs
+# additional data before any of them can become the final performance judgment.
+REPLAY_REVIEWS = {
+    'D01': {294},
+    'D03': {30, 68, 82, 222, 288, 289, 296, 297, 298, 301},
+    'D04': {8, 14, 288, 289, 301, 332},
+    'D05': {148, 149, 167, 173, 222, 289, 298, 301},
+    'D08': {19, 29, 32, 65, 68, 148, 167, 173, 288, 289, 298, 301, 314, 350, 360, 361},
+    'D09': {19, 306, 314, 350},
+    'D11': {29, 30, 32},
+    'D13': {17, 30, 71, 82, 120, 288, 289, 296, 297, 298, 301, 346},
+}
 
 
 def captured(name, reverse=False):
@@ -39,11 +51,21 @@ def test_captured_expansion_and_reverse(name, reverse):
     if reverse and expected != 'equivalent' and expected != 'review':
         expected = 'worse' if expected == 'better' else 'better'
     assert item['compare_status'] == 'changed'
+    evidence = item['assessment_evidence']
+    cards = {key for key, numbers in REPLAY_REVIEWS.items() if int(name.rsplit('-', 1)[1]) in numbers}
+    required = cards & {'D01', 'D02', 'D08', 'D10'}
+    assert {r['rule_id'] for r in evidence['mandatory_reviews']} == required
+    assert {r['rule_id'] for r in evidence['runtime_notes']} == cards - required
+    # Preserve the original positive and reversal assertions for the underlying
+    # structural/model layer independently of the new mandatory final gate.
+    assert evaluate({**evidence, 'mandatory_reviews': []})['status'] == expected
+    if required:
+        expected = 'review'
     assert item['assessment']['status'] == expected, item['assessment']
     if expected != 'review':
         assert not item['assessment']['uncovered']
         assert item['assessment']['matched']
-    assert evaluate(item['assessment_evidence'], [r['id'] for r in RULE_CATALOG])['status'] == expected
+    assert evaluate(item['assessment_evidence'], [r['id'] for r in RULE_CATALOG])['status'] == ('review' if cards else expected)
     assert evaluate(item['assessment_evidence'], [])['status'] == 'review'
 
 
@@ -96,6 +118,14 @@ def test_unknown_version_cannot_use_source_specific_rules():
     assert estimate_tradeoff(query, old, new, FIXTURE['schema_evidence'], captures) is None
 
 
+@pytest.mark.parametrize("version,expected", [("v7.1.9-0.3", False), ("v8.5.7", True)])
+def test_projection_source_proof_is_scoped_separately_from_field_format_rules(version, expected):
+    _, query, old, new, captures = captured('captured-0021')
+    captures['new'].version = version
+    proof = prove_plans(query, old, new, FIXTURE['schema_evidence'], captures)
+    assert bool(proof and any(p['rule_id'] == 'A07' for p in proof)) == expected
+
+
 def test_long_constant_requires_complete_binding_not_just_prefix_and_length():
     _, query, old, new, captures = captured('captured-0115')
     value = query.parameters[0]['value']
@@ -121,6 +151,9 @@ def test_lineage_rejects_changed_computed_expression():
 def test_correlated_range_change_is_not_extra_scan_io():
     item, query, old, new, captures = captured('captured-0082')
     assert item['assessment']['status'] == 'equivalent'
+    assert not item['assessment_evidence']['mandatory_reviews']
+    assert {r['rule_id'] for r in item['assessment_evidence']['runtime_notes']} == {'D03', 'D13'}
+    assert evaluate(item['assessment_evidence'], [r['id'] for r in RULE_CATALOG])['status'] == 'review'
     assert 'E07' in {m['rule_id'] for m in item['assessment_evidence']['matches']}
     assert estimate_tradeoff(query, old, new, FIXTURE['schema_evidence'], captures) is None
     node = next(n for root in new.roots for n in walk(root) if n.operator == 'Selection')

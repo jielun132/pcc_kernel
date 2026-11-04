@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -25,10 +26,13 @@ def read_json(path: Path):
 
 
 def read_jsonl(path: Path) -> list[dict]:
+    return list(iter_jsonl(path))
+
+
+def iter_jsonl(path: Path):
     try:
         if path.is_symlink():
             raise ValueError
-        rows = []
         with path.open(encoding="utf-8") as stream:
             for line in stream:
                 if len(line) > MAX_FILE_BYTES:
@@ -37,8 +41,7 @@ def read_jsonl(path: Path) -> list[dict]:
                     row = json.loads(line, parse_float=__import__("decimal").Decimal)
                     if not isinstance(row, dict):
                         raise ValueError
-                    rows.append(row)
-        return rows
+                    yield row
     except (ValueError, OSError):
         raise PCCError("ARTIFACT_INVALID", f"无法读取 JSONL: {path.name}") from None
 
@@ -51,18 +54,29 @@ def sync_directory(path: Path):
         os.close(fd)
 
 
-def write_bytes(path: Path, data: bytes):
+@contextlib.contextmanager
+def atomic_writer(path: Path, mode="wb", **options):
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink() or path.with_name(path.name + ".part").is_symlink():
         raise PCCError("UNSAFE_PATH", "拒绝向符号链接写入")
     temporary = path.with_name(path.name + ".part")
-    with temporary.open("wb") as stream:
+    with temporary.open(mode, **options) as stream:
         os.chmod(temporary, 0o600)
-        stream.write(data)
+        yield stream
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
     sync_directory(path.parent)
+
+
+def write_bytes(path: Path, data: bytes):
+    with atomic_writer(path) as stream:
+        stream.write(data)
+
+
+def file_hash(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def write_json(path: Path, value):
@@ -70,7 +84,9 @@ def write_json(path: Path, value):
 
 
 def write_jsonl(path: Path, rows):
-    write_bytes(path, "".join(canonical(row) + "\n" for row in rows).encode())
+    with atomic_writer(path) as stream:
+        for row in rows:
+            stream.write((canonical(row) + "\n").encode())
 
 
 def safe_path(root: Path, name: str) -> Path:
@@ -97,7 +113,7 @@ def verify(root: Path, kind: str | None = None) -> dict:
         raise PCCError("ARTIFACT_INVALID", "缺少文件清单")
     for name, expected in files.items():
         path = safe_path(root, name)
-        if not path.is_file() or path.stat().st_size > MAX_FILE_BYTES or byte_hash(path.read_bytes()) != expected:
+        if not path.is_file() or path.stat().st_size > MAX_FILE_BYTES or file_hash(path) != expected:
             raise PCCError("HASH_MISMATCH", f"文件校验失败: {name}")
     actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
     if actual != set(files) | {"manifest.json"}:
@@ -114,7 +130,7 @@ def finalize(root: Path, manifest: dict) -> dict:
         if path.is_symlink():
             raise PCCError("UNSAFE_PATH", "输出含符号链接")
         if path.is_file() and path != root / "manifest.json":
-            files[path.relative_to(root).as_posix()] = byte_hash(path.read_bytes())
+            files[path.relative_to(root).as_posix()] = file_hash(path)
     result = {**manifest, "contract_version": CONTRACT_VERSION, "files": files}
     write_json(root / "manifest.json", result)
     verify(root)
@@ -140,10 +156,11 @@ def source_lock(path: Path):
 class Publication:
     """Retain interrupted work; never overwrite a published directory."""
 
-    def __init__(self, output: str, fingerprint: str, resume=False):
+    def __init__(self, output: str, fingerprint: str, resume=False, *, compatible_fingerprints=()):
         self.output = Path(output).absolute()
         self.work = self.output.with_name("." + self.output.name + ".partial")
         self.fingerprint, self.resume = fingerprint, resume
+        self.compatible_fingerprints = compatible_fingerprints
         self.lock = source_lock(self.output.with_name("." + self.output.name + ".lock"))
 
     def __enter__(self):
@@ -155,10 +172,10 @@ class Publication:
                 if not self.resume or self.work.is_symlink():
                     raise PCCError("OUTPUT_EXISTS", "存在中断产物，请使用 --resume 或新目录")
                 state = read_json(self.work / "checkpoint.json")
-                if state.get("fingerprint") != self.fingerprint:
+                if state.get("fingerprint") not in (self.fingerprint, *self.compatible_fingerprints):
                     raise PCCError("RESUME_MISMATCH", "输入、上下文或算法指纹变化，不能复用旧结果")
                 for name, expected in state.get("files", {}).items():
-                    if byte_hash(safe_path(self.work, name).read_bytes()) != expected:
+                    if file_hash(safe_path(self.work, name)) != expected:
                         raise PCCError("HASH_MISMATCH", "恢复检查点校验失败")
             else:
                 self.work.mkdir(parents=True, mode=0o700)
@@ -169,7 +186,7 @@ class Publication:
             raise
 
     def checkpoint(self, **extra):
-        files = {p.relative_to(self.work).as_posix(): byte_hash(p.read_bytes())
+        files = {p.relative_to(self.work).as_posix(): file_hash(p)
                  for p in self.work.rglob("*") if p.is_file() and p not in {self.work / "checkpoint.json", self.work / "manifest.json"}
                  and not p.name.endswith(".part")}
         write_json(self.work / "checkpoint.json", {"fingerprint": self.fingerprint, "files": files, **extra})

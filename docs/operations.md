@@ -1,6 +1,6 @@
 # 操作约定与支持边界
 
-生产连接只执行源元数据、Statement Summary、SHOW 和 Status API 读取；`collect/export` 不写生产数据库。`compare` 仅接受 `role=test` 的两个不同 SQL 端点，worker 独占连接，执行同连接 USE、白名单 SESSION 设置、普通 EXPLAIN 和紧随的 SHOW WARNINGS。带明确 parameters 的样例使用 SQL PREPARE 准备 EXPLAIN 本身、固定名称的用户变量绑定和 EXECUTE；连接关闭释放 Prepared Statement，业务 DML 不会执行。测试目标应直连固定 TiDB 节点，不应使用无法固定后端的负载均衡地址。默认每端最多并发 2、连接超时 5 秒、每次 EXPLAIN 30 秒、读取超时至少 35 秒。
+生产连接只执行源元数据、Statement Summary、SHOW 和 Status API 读取；`collect/export` 不写生产数据库。`compare` 仅接受 `role=test` 的两个不同 SQL 端点，worker 独占连接，执行同连接 USE、白名单 SESSION 设置、普通 EXPLAIN 和紧随的 SHOW WARNINGS。带明确 parameters 的样例使用 SQL PREPARE 准备 EXPLAIN 本身、固定名称的用户变量绑定和 EXECUTE；连接关闭释放 Prepared Statement，业务 DML 不会执行。测试目标应直连固定 TiDB 节点，不应使用无法固定后端的负载均衡地址。默认从首批开始每端并发 8 份采集，可用 CLI 的 `--concurrency` 或菜单配置 `workflow.concurrency` 设为 1 至 16。按材料中的表依赖交错派发，只有同表任务时照常填满空位。连接超时 5 秒、每次 EXPLAIN 30 秒、读取超时至少 35 秒。
 
 权限按实际环境验证：源端读取 Summary、CLUSTER_INFO、SHOW CREATE、SHOW STATS、SHOW GLOBAL BINDINGS；Status API 读取 `/status`、`/stats/dump/<db>/<table>`；目标端读取材料及执行普通 EXPLAIN、允许的 SESSION SET；取消连接需要可终止本任务查询并读取 CLUSTER_PROCESSLIST 的权限。能力不可见会记录失败或覆盖限制，不自行提高权限或修改全局配置。
 
@@ -12,7 +12,9 @@ SQL 语义、字符集/排序规则、时区、引擎/MPP/Binding，以及显式
 
 材料包含 SHOW CREATE DATABASE/TABLE/VIEW，视图按依赖递归排列；保留原始统计 JSON 字节与 hash。Sequence、Placement Policy、外键、临时表及不能解析的视图依赖明确报错。TiFlash/MPP、数据相关子查询的生产复现仍需集群能力或数据条件；仅 schema+stats 不构成完整生产快照。
 
-`prepare` 只生成可审核的 SQL 和核验清单。已有对象必须先比对结构，人工跳过相应 CREATE；没有自动 DROP/TRUNCATE/ANALYZE 或 `--apply`。LOAD STATS 的绝对路径、MySQL 客户端 local infile 传输和精确补丁行为必须由隔离环境验证。PCC 自身连接始终关闭 local_infile 和多语句能力。
+`prepare` 只生成可审核的 SQL 和核验清单。已有对象必须先比对结构，人工跳过相应 CREATE；没有自动 DROP/TRUNCATE/ANALYZE 或 `--apply`。LOAD STATS 的绝对路径、MySQL 客户端 local infile 传输和精确补丁行为必须由隔离环境验证。PCC 的 PyMySQL 连接始终关闭 local_infile 和多语句能力。
+
+0.1.6 的终端菜单在用户输入 `IMPORT` 后，通过 MySQL 8 客户端执行已生成的导入文件。自动导入要求三个环境声明精确版本、两个目标为 `role=test`、集群节点无重叠、两个目标都不存在待导入库；写入前和确认后均核验。密码只进入子进程环境，原始客户端错误不会直接打印。导入失败保留已完成的目标及材料，不重放已成功的一端、不清理或覆盖部分对象。纯操作步骤见 [交互菜单](interactive.md)。
 
 `--targets old,new` 为两个配置名生成各自的 `import_commands.sql`、`verification.sql` 和 `plan.json`，结构与统计原文件共用 `prepared/materials/`。当前两个目标的导入 SQL 内容相同，不根据版本转换格式；该参数不表示向两个集群实际导入。时间范围和五维 Top N 在 `export` 选择，`prepare` 不再筛 SQL。
 
