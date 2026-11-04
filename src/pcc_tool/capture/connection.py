@@ -20,7 +20,8 @@ TLS_KEYS = {"ca", "cert", "key"}
 CONTEXT_VARIABLES = ("sql_mode", "time_zone", "collation_connection", "character_set_connection",
                      "tidb_enable_index_merge", "tidb_isolation_read_engines", "tidb_allow_mpp", "tidb_enforce_mpp",
                      "tidb_opt_fix_control", "tidb_cost_model_version", "tidb_enable_new_only_full_group_by_check",
-                     "tidb_enable_plan_cache_for_param_limit", "tidb_use_plan_baselines", "tidb_stats_load_sync_wait")
+                     "tidb_enable_plan_cache_for_param_limit", "tidb_use_plan_baselines", "tidb_stats_load_sync_wait",
+                     "tidb_opt_projection_push_down")
 
 
 def load_profiles(path: str | None) -> dict:
@@ -92,6 +93,12 @@ def clean_cell(value):
     return primitive(value)
 
 
+class DBConnectError(PCCError):
+    def __init__(self, driver_code):
+        self.driver_code = driver_code
+        super().__init__("DB_CONNECT_FAILED", f"数据库连接失败，驱动错误码 {driver_code}")
+
+
 class Database:
     def __init__(self, profile: dict, timeout_seconds=30):
         self.profile = validate_profile(profile)
@@ -116,7 +123,7 @@ class Database:
                 local_infile=False, client_flag=0, conv=converters, ssl=tls_context(self.profile.get("tls")))
         except Exception as exc:
             code = exc.args[0] if exc.args and isinstance(exc.args[0], int) else "unknown"
-            raise PCCError("DB_CONNECT_FAILED", f"数据库连接失败，驱动错误码 {code}") from None
+            raise DBConnectError(code) from None
         finally:
             password = None
         if self.profile.get("tls") is not None and not isinstance(self.connection._sock, ssl.SSLSocket):
@@ -159,12 +166,13 @@ class Database:
         return actual
 
     def variables(self, names=CONTEXT_VARIABLES) -> dict:
-        result = {}
-        for name in names:
-            rows = self.query("SHOW SESSION VARIABLES LIKE %s", (name,))[1]
-            exact = [row for row in rows if row[0].lower() == name.lower()]
-            result[name] = exact[0][1] if exact else None
-        return result
+        names = tuple(names)
+        if not names:
+            return {}
+        slots = ", ".join(["%s"] * len(names))
+        _, rows = self.query(f"SHOW SESSION VARIABLES WHERE Variable_name IN ({slots})", names)
+        values = {name.lower(): value for name, value in rows}
+        return {name: values.get(name.lower()) for name in names}
 
     def set_session(self, settings: dict):
         for key, value in validate_session(settings).items():

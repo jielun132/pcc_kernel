@@ -1,13 +1,13 @@
 import csv
 import html
-import io
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 
-from pcc_tool.artifacts.store import write_bytes
+from pcc_tool import __version__
+from pcc_tool.artifacts.store import atomic_writer
 from pcc_tool.models import canonical, primitive
 from pcc_tool.render.findings import comparison_method, findings_panel, grouping_panel, unavailable_reason
-from pcc_tool.render.navigation import NAV_STYLES, SCRIPT, navigation_markup, plan_copy_text, plan_group
+from pcc_tool.render.navigation import NAV_STYLES, SCRIPT, navigation_chunks, plan_copy_text, plan_group
 from pcc_tool.render.assessment import ASSESSMENT_SCRIPT, ASSESSMENT_STYLES, assessment_markup
 
 STATUS_LABELS = {"same": "执行计划一致", "changed": "存在差异", "incomparable": "无法比对", "not_run": "无法比对"}
@@ -22,7 +22,8 @@ SESSION_LABELS = {"time_zone": "时区", "sql_mode": "SQL 模式", "character_se
                   "tidb_allow_mpp": "允许 MPP", "tidb_enforce_mpp": "强制 MPP",
                   "tidb_use_plan_baselines": "使用执行计划绑定", "tidb_enable_index_merge": "允许 Index Merge",
                   "tidb_enable_plan_cache_for_param_limit": "参数化 LIMIT 的计划缓存",
-                  "tidb_stats_load_sync_wait": "统计信息同步加载等待时间", "tidb_cost_model_version": "代价模型版本"}
+                  "tidb_stats_load_sync_wait": "统计信息同步加载等待时间", "tidb_cost_model_version": "代价模型版本",
+                  "tidb_opt_projection_push_down": "允许将投影下推到 TiKV"}
 ISSUE_LABELS = {"NEEDS_EXECUTABLE_SAMPLE": "需要补充可执行样例", "CONTEXT_DIFFERENCE": "两端环境设置不同",
                 "DB_QUERY_FAILED": "数据库获取计划时报错",
                 "INSTANCE_NO_VISIBLE_ROWS": "源端节点没有可对应的采集记录", "STATS_NOT_READY": "统计信息尚未就绪",
@@ -470,24 +471,22 @@ mark{color:inherit;border-radius:3px;padding:1px 2px}.removed{background:#f8dcd6
 '''
 
 
-def render_reports(root, result, queries, snapshots, irs, selection, context):
-    buffer = io.StringIO(newline="")
-    writer = csv.writer(buffer)
-    writer.writerow(["query_id", "schema", "compare_status", "sql_text", "event", "field", "old", "new", "requires_review", "parameters"])
+def _report_records(result, queries, snapshots, irs, writer):
     diffs_by_query = {}
     for event in result.diffs:
         diffs_by_query.setdefault(event.query_id, []).append(event)
     query_by_id = {q.query_id: q for q in queries}
-    cards = []
-    records = []
     for index, item in enumerate(result.items, 1):
         q = query_by_id[item["query_id"]]
         events = diffs_by_query.get(q.query_id, [])
         for event in events or [None]:
             writer.writerow([csv_safe(v) for v in (q.query_id, q.schema, item["compare_status"], q.sql_text,
                 event.type if event else "", event.field if event else "", canonical(event.old) if event else "",
-                canonical(event.new) if event else "", event.requires_review if event else item.get("requires_review", False),
-                canonical(q.parameters) if q.parameters is not None else "")])
+                canonical(event.new) if event else "", item.get("requires_review", False) or bool(event and event.requires_review),
+                canonical(q.parameters) if q.parameters is not None else "", item.get("assessment", {}).get("status", ""),
+                " / ".join(item.get("assessment", {}).get("reasons", [])),
+                " / ".join(r["rule_id"] + " · " + r["reason"] + " " + r["check"]
+                           for r in item.get("assessment_evidence", {}).get("runtime_notes", [])))])
         anchor = f"query-{index}"
         sides = []
         for side in ("old", "new"):
@@ -511,10 +510,11 @@ def render_reports(root, result, queries, snapshots, irs, selection, context):
         needs_attention = status != "same" or item.get("requires_review", False)
         note = unavailable_reason(item, ISSUE_LABELS)
         facts_html = findings_panel(item, events, anchor)
+        case_label = " · ".join(dict.fromkeys(str(o["case_id"]) for o in q.sample_origins if o.get("case_id")))
         category = status if status in {"same", "changed"} else "unavailable"
-        cards.append(f'<article id="{anchor}" data-status="{escaped(status)}" data-attention="{str(needs_attention).lower()}" '
+        card = (f'<article id="{anchor}" data-status="{escaped(status)}" data-attention="{str(needs_attention).lower()}" '
                      f'data-category="{category}" data-needs-sample="{str(bool(item.get("needs_sample"))).lower()}">'
-                     f'<div class="card-heading"><div><h2>SQL <span class="query-number">#{index:03d}</span></h2>'
+                     f'<div class="card-heading"><div><h2>SQL <span class="query-number">#{index:03d}</span>{(" · " + escaped(case_label)) if case_label else ""}</h2>'
                      f'<p class="query-schema" title="{escaped(q.schema or "全限定 SQL")}">{escaped(q.schema or "全限定 SQL")}</p></div>'
                      f'<span class="badge {escaped(status)}">{escaped(STATUS_LABELS[status])}</span></div>'
                      f'<pre class="sql">{escaped(q.sql_text or "缺少可执行样例")}</pre>'
@@ -530,20 +530,25 @@ def render_reports(root, result, queries, snapshots, irs, selection, context):
                      f'<p class="id">{escaped(q.query_id)}</p>{diff_html}<div class="raw-plans">{"".join(sides)}</div>'
                      f'<details><summary>排名、来源、覆盖与问题</summary><pre>{escaped({"metrics": q.metrics, "origins": q.sample_origins, "item": item})}</pre></details></details></article>')
         group_key, group_title = plan_group(irs, q.query_id, status)
-        records.append(dict(id=anchor, queryId=q.query_id, number=index, schema=q.schema, status=status, category=category,
+        yield dict(id=anchor, queryId=q.query_id, number=index, schema=q.schema, status=status, category=category,
                             attention=needs_attention, needsSample=bool(item.get("needs_sample")),
                             assessment=item.get("assessment"), assessmentEvidence=item.get("assessment_evidence", dict(
                                 scope=status, event_refs=[str(i) for i in range(1, len(events) + 1)], matches=[], hints=[], blockers=["没有规则证据"])),
                             planGroup=group_key, planTitle=group_title,
                             preview=" ".join((q.sql_text or "缺少可执行样例").split())[:100],
-                            search=(q.schema + " " + q.query_id + " " + (q.sql_text or "") + " " +
+                            search=(q.schema + " " + q.query_id + " " + case_label + " " + (q.sql_text or "") + " " +
+                                    " ".join(r["rule_id"] for group in ("mandatory_reviews", "runtime_notes")
+                                             for r in item.get("assessment_evidence", {}).get(group, [])) + " " +
                                     " ".join(tree_text(irs.get((q.query_id, side))) for side in ("old", "new"))).lower(),
                             oldPlan=plan_copy_text(snapshots.get((q.query_id, "old")), irs.get((q.query_id, "old"))),
                             newPlan=plan_copy_text(snapshots.get((q.query_id, "new")), irs.get((q.query_id, "new"))),
-                            html=cards[-1]))
-    report = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+                            html=card)
+
+
+def render_reports(root, result, queries, snapshots, irs, selection, context):
+    report = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
-<title>PCC 执行计划比较报告 · 0.1.5</title><style>''' + STYLES + NAV_STYLES + ASSESSMENT_STYLES + '</style></head><body><main><header><div class="heading"><div><p class="eyebrow">PCC · 0.1.5</p><h1>执行计划比较</h1></div>'
+<title>PCC 执行计划比较报告 · {__version__}</title><style>''' + STYLES + NAV_STYLES + ASSESSMENT_STYLES + f'</style></head><body><main><header><div class="heading"><div><p class="eyebrow">PCC · {__version__}</p><h1>执行计划比较</h1></div>'
     status_label = {"completed": "完成", "partial": "部分完成", "blocked": "前置条件不足", "interrupted": "已中断"}[result.run_status]
     report += f'<span class="run-status">{status_label}</span></div>'
     report += f'<p class="subtitle">{escaped(_versions(snapshots, "old"))}<span class="version-arrow">→</span>{escaped(_versions(snapshots, "new"))}</p>'
@@ -568,7 +573,11 @@ def render_reports(root, result, queries, snapshots, irs, selection, context):
     report += report_overview(selection, context, result, queries, snapshots) + comparison_method()
     report += grouping_panel(result.items, queries) + '</div></details></div></header>'
     report += assessment_markup(result.fingerprint)
-    report += navigation_markup(records)
-    report += '</main><script>' + ASSESSMENT_SCRIPT + SCRIPT + '</script></body></html>'
-    write_bytes(root / "report.html", report.encode())
-    write_bytes(root / "differences.csv", buffer.getvalue().encode("utf-8-sig"))
+    with atomic_writer(root / "differences.csv", "w", encoding="utf-8-sig", newline="") as csv_file, \
+            atomic_writer(root / "report.html", "w", encoding="utf-8", newline="") as html_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["query_id", "schema", "compare_status", "sql_text", "event", "field", "old", "new", "requires_review", "parameters",
+                         "assessment", "review_reasons", "runtime_notes"])
+        html_file.write(report)
+        html_file.writelines(navigation_chunks(_report_records(result, queries, snapshots, irs, writer)))
+        html_file.write('</main><script>' + ASSESSMENT_SCRIPT + SCRIPT + '</script></body></html>')

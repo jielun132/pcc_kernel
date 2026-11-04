@@ -40,6 +40,34 @@ def test_inconsistent_vector_reset_reported(summary_row):
     assert {i["code"] for i in issues} == {"COUNTER_RESET_OR_AMBIGUOUS"}
 
 
+@pytest.mark.parametrize("outside", [dict(schema_name="other"), dict(stmt_type="Insert"),
+    dict(summary_begin_time="2026-10-07T09:00:00+08:00", summary_end_time="2026-10-07T09:30:00+08:00")])
+def test_outside_selection_counter_issues_remain_archived_without_blocking_selected_sql(summary_row, outside):
+    rows = [summary_row(schema_name="app", sql_digest="wanted"),
+            summary_row(schema_name="app", sql_digest="outside", exec_count="20", sum_latency="200", **{k:v for k,v in outside.items() if k != 'schema_name'}),
+            summary_row(schema_name="app", sql_digest="outside", exec_count="30", sum_latency="100",
+                        collected_at="2026-10-08T09:20:00+08:00", **{k:v for k,v in outside.items() if k != 'schema_name'})]
+    if "schema_name" in outside:
+        for row in rows[1:]:
+            row["schema_name"] = outside["schema_name"]
+    original_issues = merge_snapshots(rows)[1]
+    queries, selection, issues = select_queries(rows, schemas=("app",), **WINDOW)
+    assert [q.source_digest for q in queries] == ["wanted"]
+    assert not issues
+    assert selection["excluded_counter_issues"] == original_issues
+    assert original_issues[0]["code"] == "COUNTER_RESET_OR_AMBIGUOUS"
+
+
+def test_eligible_counter_anomaly_kept_even_when_not_top_n(summary_row):
+    rows = [summary_row(sql_digest="winner", exec_count="100", sum_latency="1000"),
+            summary_row(sql_digest="small", exec_count="20", sum_latency="200"),
+            summary_row(sql_digest="small", exec_count="30", sum_latency="100", collected_at="2026-10-08T09:20:00+08:00")]
+    queries, selection, issues = select_queries(rows, top_n=1, order_by=("execution_count",), **WINDOW)
+    assert [q.source_digest for q in queries] == ["winner"]
+    assert issues[0]["code"] == "COUNTER_RESET_OR_AMBIGUOUS"
+    assert "excluded_counter_issues" not in selection
+
+
 def test_epochs_are_separate(summary_row):
     merged, _ = merge_snapshots([summary_row(source_epoch="one"), summary_row(source_epoch="two")])
     assert len(merged) == 2

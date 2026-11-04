@@ -9,6 +9,25 @@ from pcc_tool.capture.parameters import prepare_explain
 from pcc_tool.models import PCCError, PlanSnapshot, QueryCase, now
 
 
+class CaptureGuard:
+    """Keep at most one validated long text per comparison, never its syntax tree."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.previous = None
+
+    def check(self, query):
+        allowed = ("select", "update", "delete", query.statement_type)
+        if len(query.sql_text or "") < 32768:
+            guard_sql(query.sql_text, allowed, parameters=query.parameters)
+            return
+        with self.lock:
+            key = (query.sql_text, allowed)
+            if query.parameters is None and self.previous == key:
+                return
+            guard_sql(query.sql_text, allowed, parameters=query.parameters)
+            self.previous = key if query.parameters is None else None
+
+
 def negotiate_format(db: Database) -> list[str]:
     supported = []
     for fmt in ("tidb_json", "row"):
@@ -27,8 +46,9 @@ def negotiate_format(db: Database) -> list[str]:
 
 def capture_plan(query: QueryCase, side: str, profile: dict, *, format="row", session=None,
                  timeout_seconds=30, stats_retries=1, binding_policy="exclude", cancel=None,
-                 db_factory=Database) -> PlanSnapshot:
+                 db_factory=Database, guard=None, on_stage=None) -> PlanSnapshot:
     snapshot = PlanSnapshot(query.query_id, side, format=format)
+    capture_started = time.monotonic()
     cancel = cancel or threading.Event()
     if cancel.is_set():
         snapshot.capture_status = "skipped"
@@ -40,9 +60,12 @@ def capture_plan(query: QueryCase, side: str, profile: dict, *, format="row", se
     try:
         if format not in {"row", "tidb_json"}:
             raise PCCError("PLAN_FORMAT_UNSUPPORTED", "不支持的 EXPLAIN 格式")
-        guard_sql(query.sql_text, ("select", "update", "delete", query.statement_type), parameters=query.parameters)
+        (guard or CaptureGuard()).check(query)
         settings = validate_session({**profile.get("session", {}), **query.context, **(session or {})})
+        stage = on_stage or (lambda _: None)
+        stage("connect")
         with db_factory(profile, timeout_seconds) as db:
+            stage("session")
             snapshot.version = db.version()
             if query.schema:
                 db.query("USE " + quote_identifier(query.schema))
@@ -81,6 +104,7 @@ def capture_plan(query: QueryCase, side: str, profile: dict, *, format="row", se
                         if not cancel.is_set() and time.monotonic() < deadline:
                             continue
                         timeout.set()
+                        stage("cancel_wait")
                         snapshot.cancellation = "pending"
                         try:
                             with db_factory(profile, 5) as control:
@@ -108,15 +132,22 @@ def capture_plan(query: QueryCase, side: str, profile: dict, *, format="row", se
                         raise PCCError("CANCELLED" if cancel.is_set() else "EXPLAIN_TIMEOUT", "计划捕获已取消或超时")
                 try:
                     if query.parameters is not None and attempt == 0:
+                        stage("prepare")
                         statement, warnings = prepare_explain(db, query.sql_text, query.parameters, format, check_cancelled)
                         snapshot.context["prepare_warnings"] = warnings
                     check_cancelled()
+                    stage("explain")
+                    explain_started = time.monotonic()
                     snapshot.columns, snapshot.rows = db.query(statement)
+                    explain_ms = int((time.monotonic() - explain_started) * 1000)
                     finished.set()
                     # This must be the very next command on this connection.
+                    stage("warnings")
                     snapshot.warnings = db.records("SHOW WARNINGS")
                 finally:
                     finished.set()
+                    if timeout.is_set():
+                        stage("cancel_wait")
                     thread.join(timeout=12)
                     if thread.is_alive():
                         snapshot.issues.append({"code": "CANCELLATION_PENDING", "message": "控制连接尚未确认服务端结束"})
@@ -125,7 +156,7 @@ def capture_plan(query: QueryCase, side: str, profile: dict, *, format="row", se
                     snapshot.issues.append({"code": "CANCELLED" if cancel.is_set() else "EXPLAIN_TIMEOUT",
                                             "cancellation": snapshot.cancellation})
                     break
-                snapshot.attempts.append({"attempt": attempt + 1, "captured_at": now(), "columns": snapshot.columns,
+                snapshot.attempts.append({"attempt": attempt + 1, "captured_at": now(), "explain_ms": explain_ms, "columns": snapshot.columns,
                                           "rows": snapshot.rows, "warnings": snapshot.warnings})
                 raw = str(snapshot.rows).lower()
                 warning_text = str(snapshot.warnings).lower()
@@ -138,6 +169,7 @@ def capture_plan(query: QueryCase, side: str, profile: dict, *, format="row", se
                 elif cancel.wait(min(attempt + 1, 3)):
                     snapshot.capture_status = "skipped"
                     break
+            stage("postcheck")
             snapshot.context["session_after"] = db.variables()
             if snapshot.context["session"] != snapshot.context["session_after"]:
                 snapshot.issues.append({"code": "CONTEXT_DRIFT"})
@@ -150,4 +182,5 @@ def capture_plan(query: QueryCase, side: str, profile: dict, *, format="row", se
                                     "cancellation": snapshot.cancellation})
         snapshot.issues.append({"code": exc.code, "message": exc.message})
     snapshot.captured_at = now()
+    snapshot.context["capture_elapsed_ms"] = int((time.monotonic() - capture_started) * 1000)
     return snapshot

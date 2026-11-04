@@ -11,15 +11,16 @@ def assessment_markup(fingerprint):
                   report_fingerprint=fingerprint, rules_fingerprint=digest(RULE_CATALOG))
     payload = json.dumps(config, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     groups = []
-    for key, title in (("directional", "方向判断"), ("equivalent", "基本等价"), ("review", "复杂变化复核")):
+    for key, title in (("data_review", "默认必审"), ("runtime_note", "运行时提示 · 按需加入复核"),
+                       ("directional", "方向判断"), ("equivalent", "基本等价"), ("review", "复杂变化复核")):
         cards = []
         for rule in RULE_CATALOG:
             if rule["group"] != key:
                 continue
             esc = html.escape
             cards.append(f'<label class="rule-card"><span class="rule-card-title"><input type="checkbox" data-rule-id="{rule["id"]}"'
-                + (' checked' if rule["default"] else '') + f'> <strong>{rule["id"]} · {esc(rule["title"])}</strong></span>'
-                f'<span class="rule-support">{"可自动预判 · 满足条件才生效" if rule["automatic"] else "复核提示 · 不自动判断优劣"}</span>'
+                + (' checked' if rule["default"] else '') + (' disabled' if key == "data_review" else '') + f'> <strong>{rule["id"]} · {esc(rule["title"])}</strong></span>'
+                f'<span class="rule-support">{"命中即待复核 · 始终生效" if key == "data_review" else "详情保留提示 · 勾选才加入待复核" if key == "runtime_note" else "可自动预判 · 满足条件才生效" if rule["automatic"] else "复核提示 · 不自动判断优劣"}</span>'
                 f'<span><b>{"结论" if key != "directional" else "变优"}</b> {esc(rule["better"])}</span>'
                 f'<span><b>{"边界" if key != "directional" else "变差"}</b> {esc(rule["worse"])}</span>'
                 f'<span class="rule-premise">{esc(rule["requires"])}</span>'
@@ -27,14 +28,14 @@ def assessment_markup(fingerprint):
         groups.append(f'<details class="rule-group"><summary>{title} · {len(cards)} 张</summary><div class="rule-grid">{"".join(cards)}</div></details>')
     return '''<section class="assessment-panel" id="assessment-panel" aria-label="规则预判">
 <div class="assessment-heading"><div><p class="eyebrow">RULE ASSESSMENT</p><h2>按规则预判计划变化</h2>
-<p>仅判断存在差异的 SQL。变优、变差均为规则推断，基本等价不等于实测耗时相当。</p></div>
+<p>先判断普通 EXPLAIN 是否代表有数据时的计划，再判断计划差异。命中率、循环和内存等运行时信息列在每条 SQL 的详情中。</p></div>
 <button type="button" id="run-assessment" class="assessment-primary">按所选规则重新判断</button></div>
 <div id="assessment-counts" class="assessment-counts" role="group" aria-label="按预判结果筛选"></div>
 <p id="assessment-state" class="assessment-state" role="status" aria-live="polite"></p>
 <details class="rule-settings"><summary>选择规则与阈值 · ''' + str(len(RULE_CATALOG)) + ''' 张规则卡</summary>
-<p class="rule-explanation">勾选后点击上方按钮生效。每次都判断报告内全部差异 SQL，分页、搜索和暂缓查看的库不影响范围。
+<p class="rule-explanation">勾选后点击上方按钮生效。默认复核可能提前读表、仅靠模型评分、缺定义或差异证据不足的 SQL。可另外勾选要实测的运行时项目。
 方向规则只在前提可验证时自动分类；复核提示卡提供检查依据。未覆盖、证据不足或方向冲突都保留“待复核”。</p>
-<div class="rule-presets"><button type="button" data-rule-preset="default">恢复推荐</button><button type="button" data-rule-preset="all">全部勾选</button><button type="button" data-rule-preset="none">全部取消</button></div>
+<div class="rule-presets"><button type="button" data-rule-preset="default">恢复推荐</button><button type="button" data-rule-preset="runtime">推荐规则＋复核运行代价</button><button type="button" data-rule-preset="all">全部勾选</button><button type="button" data-rule-preset="none">取消可选规则</button></div>
 ''' + "".join(groups) + '''<div class="rule-thresholds">
 <label>有效下推最小输入行数 <input type="number" id="threshold-min_rows" value="1000" min="1" max="1000000000" step="1"></label>
 <label>TopN / Limit 最大 K 占比 (%) <input type="number" id="threshold-max_ratio_pct" value="10" min="1" max="50" step="1"></label>
@@ -74,23 +75,30 @@ const PCCAssessment=(()=>{
     if(g.kind==='estimate')return y>0n&&(x>y?x:y)*100n*sd<=(x<y?x:y)*(100n*sd+sn);
     return false;
   }
+  function reviewCards(e,selected){
+    return [...(e.mandatory_reviews||[]),...(e.runtime_notes||[]).filter(r=>selected.includes(r.rule_id))];
+  }
   function evaluate(e,selected,thresholds){
+    const mandatory=reviewCards(e,selected).map(r=>r.rule_id+' · '+r.reason);
+    if(e.scope!=='changed'&&mandatory.length)return {status:'review',matched:[],uncovered:[],reasons:[...mandatory,...e.blockers]};
     if(e.scope!=='changed')return {status:'excluded',matched:[],uncovered:[],reasons:['只对已确认存在差异的 SQL 预判']};
     const enabled=new Set(selected),matched=[],rejected=[];
     e.matches.forEach(m=>{if(!enabled.has(m.rule_id)||(m.requires_rules||[]).some(id=>!enabled.has(id)))return;const failures=(m.guards||[]).filter(g=>!guardPass(g,thresholds)).map(g=>g.label);
       if(failures.length)rejected.push([m,m.rule_id+'：'+failures.join('、')+'未满足阈值']);else matched.push(m);});
     const covered=new Set(matched.flatMap(m=>m.event_refs.map(String))),uncovered=e.event_refs.filter(ref=>!covered.has(String(ref)));
-    const directions=new Set(matched.map(m=>m.direction).filter(x=>x!=='equivalent')),reasons=[...e.blockers,...rejected.filter(([m])=>m.event_refs.some(ref=>!covered.has(String(ref)))).map(([,reason])=>reason)];
+    const directions=new Set(matched.map(m=>m.direction).filter(x=>x!=='equivalent')),reasons=[...mandatory,...e.blockers,...rejected.filter(([m])=>m.event_refs.some(ref=>!covered.has(String(ref)))).map(([,reason])=>reason)];
     if(uncovered.length)reasons.push('存在未被所选规则完整覆盖的差异');
     if(directions.size>1)reasons.push('同时命中变优和变差，不抵消');
     return {status:reasons.length||!matched.length?'review':directions.size?[...directions][0]:'equivalent',matched:matched.map(m=>m.id),uncovered,reasons};
   }
   function csvCell(value){let s=String(value??'');if(/^[\s]*[=+@-]|^[\t\r\n]/.test(s))s="'"+s;return '"'+s.replaceAll('"','""')+'"';}
   function csv(payload){
-    const header=['query_id','sql_number','schema','compare_status','assessment','matched_rules','reasons','uncovered_event_refs','selected_rules','thresholds','assessment_version','rules_fingerprint','report_fingerprint'];
+    const header=['query_id','sql_number','schema','compare_status','assessment','matched_rules','reasons','uncovered_event_refs','selected_rules','thresholds','assessment_version','rules_fingerprint','report_fingerprint','mandatory_rules','review_steps','runtime_notes'];
     const rows=payload.results.map(r=>[r.query_id,r.number,r.schema,r.compare_status,r.result.status,
       r.evidence.matches.filter(m=>r.result.matched.includes(m.id)).map(m=>m.rule_id).join(','),r.result.reasons.join('；'),r.result.uncovered.join(','),
-      payload.selected.join(','),JSON.stringify(payload.thresholds),payload.version,payload.rules_fingerprint,payload.report_fingerprint]);
+      payload.selected.join(','),JSON.stringify(payload.thresholds),payload.version,payload.rules_fingerprint,payload.report_fingerprint,
+      (r.evidence.mandatory_reviews||[]).map(m=>m.rule_id).join(','),reviewCards(r.evidence,payload.selected).map(m=>m.check).join(' / '),
+      (r.evidence.runtime_notes||[]).map(m=>m.rule_id+' · '+m.reason+' '+m.check).join(' / ')]);
     return '\uFEFF'+[header,...rows].map(row=>row.map(csvCell).join(',')).join('\r\n');
   }
   function attach(records,refresh){
@@ -102,26 +110,29 @@ const PCCAssessment=(()=>{
     const exports=['json','csv'].map(k=>document.getElementById('export-assessment-'+k));
     let selected=[...config.selected],thresholds={...config.thresholds},filter=null,dirty=false;
     let results=new Map(records.map(r=>[r.id,r.assessment||evaluate(r.assessmentEvidence,selected,thresholds)]));
-    const scope=records.filter(r=>r.status==='changed').length;
+    const scope=()=>[...results.values()].filter(r=>r.status!=='excluded').length;
+    const mandatory=records.filter(r=>r.assessmentEvidence.mandatory_reviews?.length);
     function el(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;}
     function current(){return {selected:checks.filter(c=>c.checked).map(c=>c.dataset.ruleId),thresholds:Object.fromEntries(Object.entries(settings).map(([k,n])=>[k,n.value]))};}
     function valid(t){return Object.entries(t).every(([k,v])=>/^\d+$/.test(v)&&BigInt(v)>=1n&&BigInt(v)<=BigInt(k==='min_rows'?1000000000:k==='reduction_pct'?99:50));}
     function renderCounts(){
-      counts.replaceChildren();const total=el('button');total.type='button';total.dataset.assessmentFilter='';total.setAttribute('aria-pressed',String(filter===''));total.append(el('b',String(scope)),el('span','全部差异'));counts.append(total);
+      counts.replaceChildren();const total=el('button');total.type='button';total.dataset.assessmentFilter='';total.setAttribute('aria-pressed',String(filter===''));total.append(el('b',String(scope())),el('span','全部预判'));counts.append(total);
       ['better','worse','equivalent','review'].forEach(key=>{const button=el('button',undefined,'assessment-'+key);button.type='button';button.dataset.assessmentFilter=key;button.setAttribute('aria-pressed',String(filter===key));
         button.append(el('b',String([...results.values()].filter(r=>r.status===key).length)),el('span',labels[key]));counts.append(button);});
       counts.dataset.dirty=String(dirty);
     }
     function message(){
-      const modelCount=records.filter(r=>r.assessmentEvidence.matches.some(m=>m.basis==='estimated_work'&&results.get(r.id)?.matched.includes(m.id))).length;
-      state.dataset.dirty=String(dirty);state.textContent=dirty?'规则或阈值已修改。当前展示上次判断结果，请点击“按所选规则重新判断”。':`已选 ${selected.length} 张规则（${selected.filter(id=>rules.get(id)?.automatic).length} 张可自动预判），检查全部 ${scope} 条差异 SQL；其中 ${modelCount} 条采用工作量估算模型。${records.length-scope} 条一致或无法比对的 SQL 不参与。`;
+      const countRule=id=>mandatory.filter(r=>r.assessmentEvidence.mandatory_reviews.some(m=>id.includes(m.rule_id))).length;
+      state.dataset.dirty=String(dirty);state.textContent=dirty?'规则或阈值已修改。当前展示上次判断结果，请点击“按所选规则重新判断”。':`本次预判 ${scope()} 条。固定必审卡命中 ${mandatory.length} 条，其中可能提前读表 ${countRule(['D01','D02'])} 条，仅有代价估算 ${countRule(['D08'])} 条，缺 SQL 或视图定义 ${countRule(['D10'])} 条。卡片可重叠，总数按 SQL 去重。`;
       exports.forEach(b=>b.disabled=dirty);renderCounts();
     }
     function change(){const c=current();dirty=JSON.stringify([...c.selected].sort())!==JSON.stringify([...selected].sort())||JSON.stringify(c.thresholds)!==JSON.stringify(thresholds);message();refresh();}
     checks.forEach(c=>c.addEventListener('change',change));Object.values(settings).forEach(n=>n.addEventListener('input',change));
     document.querySelectorAll('[data-rule-preset]').forEach(button=>button.addEventListener('click',()=>{
-      checks.forEach(c=>c.checked=button.dataset.rulePreset==='all'||button.dataset.rulePreset==='default'&&config.selected.includes(c.dataset.ruleId));
-      if(button.dataset.rulePreset==='default')Object.entries(config.thresholds).forEach(([k,v])=>settings[k].value=v);change();
+      const preset=button.dataset.rulePreset;
+      checks.forEach(c=>c.checked=c.disabled||preset==='all'||(['default','runtime'].includes(preset)&&config.selected.includes(c.dataset.ruleId))||
+        (preset==='runtime'&&rules.get(c.dataset.ruleId).group==='runtime_note'));
+      if(['default','runtime'].includes(preset))Object.entries(config.thresholds).forEach(([k,v])=>settings[k].value=v);change();
     }));
     document.getElementById('run-assessment').addEventListener('click',()=>{
       const c=current();if(!valid(c.thresholds)){state.textContent='阈值需为界面标注范围内的整数；当前结果未变。';return;}
@@ -129,21 +140,28 @@ const PCCAssessment=(()=>{
     });
     counts.addEventListener('click',event=>{const b=event.target.closest('[data-assessment-filter]');if(!b)return;filter=b.dataset.assessmentFilter;renderCounts();refresh(true);});
     function payload(){return {version:config.version,rules_fingerprint:config.rules_fingerprint,report_fingerprint:config.report_fingerprint,
-      selected:[...selected],thresholds:{...thresholds},scope:'all_confirmed_changed_queries',claim:'rule_prediction_not_measured_performance',
+      selected:[...selected],thresholds:{...thresholds},scope:'changed_or_required_or_selected_runtime_review',claim:'rule_prediction_not_measured_performance',
       results:records.map(r=>({query_id:r.queryId,number:r.number,schema:r.schema,compare_status:r.status,result:results.get(r.id),evidence:r.assessmentEvidence}))};}
     function download(kind){if(dirty)return;const data=payload(),blob=new Blob([kind==='json'?JSON.stringify(data,null,2):csv(data)],{type:kind==='json'?'application/json;charset=utf-8':'text/csv;charset=utf-8'});
       const url=URL.createObjectURL(blob),a=el('a');a.href=url;a.download='pcc-assessments.'+kind;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);}
     exports.forEach((b,i)=>b.addEventListener('click',()=>download(i===0?'json':'csv')));
     function detail(record){
       if(!record)return;const host=document.getElementById(record.id)?.querySelector('.query-assessment');if(!host)return;host.replaceChildren();
-      const result=results.get(record.id);host.className='query-assessment'+(result.status==='excluded'?'':' assessment-'+result.status);
-      if(result.status==='excluded'){host.append(el('p',record.status==='same'?'计划一致，未参与差异规则预判；不代表实测性能相同。':'无法完整比较，未参与规则预判。'));return;}
-      host.append(el('h3','规则预判 · '+labels[result.status]));
+      const result=results.get(record.id),e=record.assessmentEvidence;host.className='query-assessment'+(result.status==='excluded'?'':' assessment-'+result.status);
+      if(result.status==='excluded')host.append(el('p',record.status==='same'?'原始计划一致。此项没有需要复核的计划差异。':'无法完整比较，请查看采集状态和问题记录。'));
+      else host.append(el('h3','规则预判 · '+labels[result.status]));
+      if(e.runtime_notes?.length){
+        const box=el('details',undefined,'assessment-evidence');box.append(el('summary','运行时提示 · '+e.runtime_notes.length+' 项'));
+        e.runtime_notes.forEach(r=>{box.append(el('p',r.rule_id+' · '+rules.get(r.rule_id).title+' · '+(selected.includes(r.rule_id)?'已选入复核':'仅供实测参考')),
+          el('p',r.reason),el('p',r.check));});host.append(box);
+      }
+      if(result.status==='excluded')return;
       if(dirty)host.append(el('p','显示上次规则的结果，修改尚未应用。','assessment-stale'));
       result.reasons.forEach(reason=>host.append(el('p',reason)));
-      const e=record.assessmentEvidence;(e.cautions||[]).forEach(c=>host.append(el('p',c,'assessment-hint')));
+      (e.cautions||[]).forEach(c=>host.append(el('p',c,'assessment-hint')));
+      (e.mandatory_reviews||[]).forEach(r=>{const box=el('p',r.rule_id+' 复核方法 · '+r.check+' ');const link=el('a','TiDB 依据 ↗');link.href=rules.get(r.rule_id).source;link.target='_blank';link.rel='noopener noreferrer';box.append(link);host.append(box);});
       const matched=e.matches.filter(m=>result.matched.includes(m.id));
-      matched.forEach(m=>{const box=el('details',undefined,'assessment-evidence');box.append(el('summary',`${m.rule_id} · ${rules.get(m.rule_id)?.title||m.rule_id} → ${labels[m.direction]}`),el('p',m.reason));
+      matched.forEach(m=>{const box=el('details',undefined,'assessment-evidence');box.append(el('summary',`${m.rule_id} · ${rules.get(m.rule_id)?.title||m.rule_id} · ${reviewCards(e,selected).length?'仅供参考':labels[m.direction]}`),el('p',m.reason));
         if((m.requires_rules||[]).length>1)box.append(el('p','组合判断需同时勾选：'+m.requires_rules.join('、'),'assessment-hint'));
         if(m.basis==='estimated_work')box.append(el('p','估算模型预判 · 不是实测耗时；查看下方两端工作量及模型假设。','assessment-hint'));
         if(m.model){const table=el('table');const head=el('tr');['工作量指标','旧计划','新计划','权重'].forEach(s=>head.append(el('th',s)));table.append(head);
@@ -155,7 +173,7 @@ const PCCAssessment=(()=>{
       if(result.uncovered.length){const box=el('details');box.append(el('summary',`未覆盖差异 · ${result.uncovered.length} 条`));result.uncovered.forEach(ref=>{const a=el('a','差异 '+ref);a.href='#'+record.id+'-diff-'+ref;box.append(a);});host.append(box);}
       const hints=e.hints.filter(h=>selected.includes(h.rule_id));if(hints.length){const box=el('details');box.append(el('summary','复核依据与缺少的证明'));const list=el('ul');hints.forEach(h=>list.append(el('li',h.rule_id+' · '+rules.get(h.rule_id).title+'：'+h.reason)));box.append(list);host.append(box);}
     }
-    message();return {matches:r=>filter===null||(filter===''?r.status==='changed':results.get(r.id)?.status===filter),label:r=>dirty?'预判待更新':labels[results.get(r.id)?.status],
+    message();return {matches:r=>filter===null||(filter===''?results.get(r.id)?.status!=='excluded':results.get(r.id)?.status===filter),label:r=>dirty?'预判待更新':labels[results.get(r.id)?.status],
       status:r=>results.get(r.id)?.status,clearFilter:()=>{filter=null;renderCounts();},detail,payload,isDirty:()=>dirty};
   }
   return {evaluate,guardPass,csv,attach};

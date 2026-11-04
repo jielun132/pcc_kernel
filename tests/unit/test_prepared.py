@@ -149,6 +149,20 @@ def test_cancel_during_binding_never_executes():
     assert not any(sql.startswith(("SET @pcc_arg_1", "EXECUTE")) for sql,_ in BindingDB.calls)
 
 
+def test_long_integer_bindings_keep_parameter_order_and_check_each_batch():
+    from pcc_tool.capture.parameters import prepare_explain
+    from test_capture import FakeDB
+    db = FakeDB({})
+    db.calls = []
+    params = [{"type": "int", "value": str(i)} for i in range(256)]
+    statement, _ = prepare_explain(db, "SELECT " + ",".join("?" for _ in params), params, "row")
+    sets = [(i, sql, values) for i, (sql, values) in enumerate(db.calls) if sql.startswith("SET ")]
+    assert len(sets) == 8
+    assert [v for _, _, values in sets for v in values] == [str(i) for i in range(256)]
+    assert all(db.calls[i+1][0] == "SHOW WARNINGS" for i, _, _ in sets)
+    assert statement == "EXECUTE pcc_explain USING " + ",".join(f"@pcc_arg_{i}" for i in range(256))
+
+
 def test_binding_warning_never_executes():
     from test_capture import FakeDB
     class CoercionDB(FakeDB):

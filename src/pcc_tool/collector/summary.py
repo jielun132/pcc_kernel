@@ -95,6 +95,7 @@ def select_queries(rows: list[dict], *, begin: str, end: str, top_n=20, order_by
     # Merge the whole history first, then apply the original-window overlap predicate.
     merged, issues = merge_snapshots(rows)
     groups = defaultdict(list)
+    eligible_identities = set()
     for r in merged:
         if not instant(r["summary_begin_time"]) < stop or not instant(r["summary_end_time"]) > start:
             continue
@@ -104,7 +105,18 @@ def select_queries(rows: list[dict], *, begin: str, end: str, top_n=20, order_by
             kind = "select"
         if (schemas and schema not in schemas) or kind not in statement_types:
             continue
+        eligible_identities.add(tuple(r.get(k, "") for k in IDENTITY))
         groups[(r["source_cluster"], schema, r["sql_digest"])].append(r)
+    # Keep the full merge evidence, but only in-scope counters can affect this
+    # ranking. Include all eligible candidates, even those outside the final Top N.
+    relevant_issues, excluded_counter_issues = [], []
+    for issue in issues:
+        if (issue.get("identity") is not None
+                and tuple(issue["identity"].get(k, "") for k in IDENTITY) not in eligible_identities):
+            excluded_counter_issues.append(issue)
+        else:
+            relevant_issues.append(issue)
+    issues = relevant_issues
     candidates = []
     for key, values in sorted(groups.items()):
         with localcontext() as decimal_context:
@@ -165,6 +177,8 @@ def select_queries(rows: list[dict], *, begin: str, end: str, top_n=20, order_by
                  "selected_digests": len(selected), "visible_digests": len(candidates),
                  "coverage": "visible_summary_only", "rankings": [
                      {k: v for k, v in c.items() if k != "rows"} for c in selected]}
+    if excluded_counter_issues:
+        selection["excluded_counter_issues"] = excluded_counter_issues
     return list(queries.values()), primitive(selection), issues
 
 

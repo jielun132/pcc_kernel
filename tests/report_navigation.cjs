@@ -53,6 +53,8 @@ if(process.argv[3]){
 }else records=Array.from({length:1053},(_,i)=>({id:`query-${i+1}`,number:i+1,schema:['sales','reports','archive'][i%3],status:['same','changed','not_run'][i%3],category:['same','changed','unavailable'][i%3],attention:i%3!==0,needsSample:i%3===2,planGroup:i%3===2?'':`shape-${i%7}`,planTitle:'HashJoin → IndexJoin',preview:`SELECT ${i+1} <script>`,search:`select ${i+1} table:orders`,oldPlan:`root\n└─old-${i+1}`,newPlan:`root\n└─new-${i+1}`,html:`<article id="query-${i+1}"></article>`}));
 nodes['report-data'].textContent=JSON.stringify(records);
 records.forEach(r=>{r.queryId??='q-'+r.number;r.assessmentEvidence??={scope:r.status,event_refs:r.status==='changed'?['1']:[],matches:r.status==='changed'?[{id:'m1',rule_id:'E01',direction:'equivalent',event_refs:['1'],old_nodes:['n0'],new_nodes:['n0'],guards:[],reason:'展示别名'}]:[],blockers:[],hints:[]};});
+if(!process.argv[3])records[0].assessmentEvidence.mandatory_reviews=[{rule_id:'D01',reason:'空表可能折叠标量子查询',check:'在有数据的隔离库比较'}];
+if(!process.argv[3])records[3].assessmentEvidence.runtime_notes=[{rule_id:'D05',reason:'第 K 行位置未知',check:'用有代表性的数据核对扫描量'}];
 const archivedAssessments=records.map(r=>r.assessment?JSON.parse(JSON.stringify(r.assessment)):null);
 nodes['report-data'].textContent=JSON.stringify(records);
 for(const id of ['assessment-config','assessment-panel','assessment-state','assessment-counts','run-assessment','export-assessment-json','export-assessment-csv',...Object.keys(config.thresholds).map(k=>'threshold-'+k)]){
@@ -60,8 +62,8 @@ for(const id of ['assessment-config','assessment-panel','assessment-state','asse
 }
 nodes['assessment-config'].textContent=JSON.stringify(config);
 Object.entries(config.thresholds).forEach(([k,v])=>nodes['threshold-'+k].value=v);
-for(const rule of config.rules){const c=new Element('input');c.dataset.ruleId=rule.id;c.checked=config.selected.includes(rule.id);doc.append(c);}
-for(const key of ['default','all','none']){const b=new Element('button');b.dataset.rulePreset=key;doc.append(b);}
+for(const rule of config.rules){const c=new Element('input');c.dataset.ruleId=rule.id;c.checked=config.selected.includes(rule.id);c.disabled=rule.group==='data_review';doc.append(c);}
+for(const key of ['default','runtime','all','none']){const b=new Element('button');b.dataset.rulePreset=key;doc.append(b);}
 let downloaded;
 const sandbox={document:doc,navigator:{clipboard:{writeText:async text=>{copied=text;}}},location:{hash:''},window:{addEventListener(){}},console,
   Blob,URL:{createObjectURL:blob=>{downloaded=blob;return 'blob:test';},revokeObjectURL(){}},setTimeout:f=>f()};
@@ -104,24 +106,42 @@ async function checks(){
   fallback=false;await read('copyPlan')(button);assert.match(card.querySelector('.copy-status').textContent,/Cmd\+C/);assert.equal(card.querySelector('textarea').value,copied);assert.ok(card.querySelector('textarea').selected);
   // Rule selection never changes the original status, nor inherits group decisions.
   const original=JSON.stringify(records.map(r=>r.status)),changed=records.filter(r=>r.status==='changed').length;
+  const inScope=records.filter(r=>r.status==='changed'||r.assessmentEvidence.mandatory_reviews?.length).length;
   const initial=JSON.parse(JSON.stringify(read('assessment.payload()')));
   assert.equal(initial.results.length,records.length);
   initial.results.forEach((r,i)=>{if(archivedAssessments[i])assert.deepEqual(r.result,archivedAssessments[i]);});
-  assert.equal(initial.results.filter(r=>r.result.status!=='excluded').length,changed);
+  assert.equal(initial.results.filter(r=>r.result.status!=='excluded').length,inScope);
   const preset=key=>doc.querySelectorAll('[data-rule-preset]').find(b=>b.dataset.rulePreset===key);
   click(preset('none'));assert.equal(read('assessment.isDirty()'),true);assert.equal(nodes['export-assessment-json'].disabled,true);
   assert.deepEqual(JSON.parse(JSON.stringify(read('assessment.payload()'))),initial);
   change('search','nothing-can-match-this-string');
   click(nodes['run-assessment']);assert.equal(read('assessment.isDirty()'),false);
-  assert.equal(read('assessment.payload().results.filter(r=>r.result.status==="review").length'),changed);
-  assert.equal(read('assessment.payload().results.filter(r=>r.result.status==="excluded").length'),records.length-changed);
+  assert.equal(read('assessment.payload().results.filter(r=>r.result.status==="review").length'),inScope);
+  assert.equal(read('assessment.payload().results.filter(r=>r.result.status==="excluded").length'),records.length-inScope);
+  assert.deepEqual([...read('assessment.payload().selected')].sort(),config.rules.filter(r=>r.group==='data_review').map(r=>r.id).sort());
   assert.equal(read('filtered.length'),0); // Recalculation did not narrow its scope to the empty view.
   click(nodes['assessment-counts'].children.find(b=>b.dataset.assessmentFilter==='review'));
-  assert.equal(read('filtered.length'),changed);assert.equal(nodes['search'].value,'');
+  assert.equal(read('filtered.length'),inScope);assert.equal(nodes['search'].value,'');
+  const heldSame=records.filter(r=>r.status==='same'&&r.assessmentEvidence.mandatory_reviews?.length);
+  assert.equal(read("filtered.filter(r=>r.status==='same').length"),heldSame.length);
+  if(heldSame.length){const r=heldSame[0];nodes['jump-number'].value=String(r.number);click(nodes['jump-query']);
+    const detail=doc.getElementById(r.id).querySelector('.query-assessment').textContent;
+    assert.match(detail,/待复核/);assert.ok(detail.includes(r.assessmentEvidence.mandatory_reviews[0].check));}
   const skippedSchema=records.find(r=>r.status==='changed').schema;
   const skipAgain=nodes['schema-scope'].querySelectorAll('input').find(c=>c.dataset.skipSchema===skippedSchema);skipAgain.checked=true;skipAgain.fire('change');
   click(preset('default'));click(nodes['run-assessment']);
   assert.deepEqual(JSON.parse(JSON.stringify(read('assessment.payload()'))),initial);
+  const optionalSame=records.find(r=>r.status==='same'&&!r.assessmentEvidence.mandatory_reviews?.length&&r.assessmentEvidence.runtime_notes?.length);
+  if(optionalSame){
+    assert.equal(initial.results.find(r=>r.query_id===optionalSame.queryId).result.status,'excluded');
+    click(preset('runtime'));click(nodes['run-assessment']);
+    click(nodes['assessment-counts'].children.find(b=>b.dataset.assessmentFilter==='review'));
+    assert.ok(read('filtered').some(r=>r.id===optionalSame.id));
+    nodes['jump-number'].value=String(optionalSame.number);click(nodes['jump-query']);
+    assert.ok(doc.getElementById(optionalSame.id).querySelector('.query-assessment').textContent.includes(optionalSame.assessmentEvidence.runtime_notes[0].check));
+    click(preset('default'));click(nodes['run-assessment']);
+    assert.deepEqual(JSON.parse(JSON.stringify(read('assessment.payload()'))),initial);
+  }
   const equalCount=initial.results.filter(r=>r.result.status==='equivalent').length;
   click(nodes['assessment-counts'].children.find(b=>b.dataset.assessmentFilter==='equivalent'));assert.equal(read('filtered.length'),equalCount);
   assert.equal(read('skipped.size'),0);

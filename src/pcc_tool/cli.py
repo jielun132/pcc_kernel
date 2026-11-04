@@ -8,7 +8,7 @@ import threading
 
 from pcc_tool import __version__, api
 from pcc_tool.capture.connection import load_profiles
-from pcc_tool.models import (METRICS, CollectRequest, CompareRequest, ComparisonResult, DiffRequest,
+from pcc_tool.models import (DEFAULT_CONCURRENCY, METRICS, CollectRequest, CompareRequest, ComparisonResult, DiffRequest,
                             DoctorRequest, ExportRequest, PCCError, PrepareRequest, canonical)
 
 
@@ -21,7 +21,11 @@ def parser():
     p.add_argument("--version", action="version", version=__version__)
     p.add_argument("--config", help="连接配置 JSON；只允许密码环境变量引用")
     p.add_argument("--events", choices=["jsonl"], help="stdout 只输出版本化事件")
-    commands = p.add_subparsers(dest="command", required=True)
+    commands = p.add_subparsers(dest="command")
+    commands.add_parser("ui", help="中文交互菜单；默认读取当前目录 pcc.json")
+    demo = commands.add_parser("demo", help="离线生成固定 SQL 案例及 source 建表造数文件")
+    demo.add_argument("--out", required=True)
+    demo.add_argument("--schema-prefix")
     doctor = commands.add_parser("doctor", help="只读检查运行包、连接与材料")
     doctor.add_argument("--bundle")
     doctor.add_argument("--targets", type=comma, default=())
@@ -55,7 +59,7 @@ def parser():
     compare.add_argument("--new", required=True)
     compare.add_argument("--out", required=True)
     compare.add_argument("--resume", action="store_true")
-    compare.add_argument("--concurrency", type=int, default=2)
+    compare.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="每个目标从首批开始的采集并发，1 至 16")
     compare.add_argument("--timeout-seconds", type=int, default=30)
     compare.add_argument("--stats-retries", type=int, default=1)
     compare.add_argument("--binding-policy", choices=["exclude", "preserve"], default="exclude")
@@ -70,6 +74,12 @@ def parser():
 def main(argv=None):
     args = vars(parser().parse_args(argv))
     command, config, events_mode = args.pop("command"), args.pop("config"), args.pop("events")
+    if command in (None, "ui"):
+        if events_mode or not sys.stdin.isatty():
+            print("交互菜单需要终端；自动化请使用原有子命令（pcc --help）。", file=sys.stderr)
+            return 2
+        from pcc_tool.interactive import run
+        return run(config)
     cancel = threading.Event()
     original = {}
     if threading.current_thread() is threading.main_thread():
@@ -84,8 +94,11 @@ def main(argv=None):
 
     try:
         # Offline diff never resolves credentials or even opens --config.
-        profiles = {} if command == "diff" else load_profiles(config)
-        if command == "compare":
+        profiles = {} if command in {"diff", "demo"} else load_profiles(config)
+        if command == "demo":
+            from pcc_tool.demo import generate
+            result = generate(**args)
+        elif command == "compare":
             result = api.compare(CompareRequest(**args), profiles=profiles, on_event=event, cancel=cancel)
         elif command == "diff":
             result = api.diff(DiffRequest(**args), on_event=event, cancel=cancel)

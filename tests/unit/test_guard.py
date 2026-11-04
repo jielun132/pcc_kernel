@@ -49,6 +49,9 @@ def test_physical_dependencies(sql, schema, expected):
 
 
 def test_session_whitelist():
+    assert validate_session({"tidb_opt_projection_push_down": "OFF"}) == {"tidb_opt_projection_push_down": 0}
+    with pytest.raises(PCCError):
+        validate_session({"tidb_opt_projection_push_down": "OFF; SELECT 1"})
     assert validate_session({"tidb_allow_mpp": "ON", "time_zone": "+08:00"}) == {"tidb_allow_mpp": 1, "time_zone": "+08:00"}
     for value in ({"autocommit": 0}, {"tidb_allow_mpp": "1;DROP TABLE t"}, {"sql_mode": "ANSI_QUOTES"},
                   {"tidb_stats_load_sync_wait": 30001}, {"tidb_isolation_read_engines": "anything"}):

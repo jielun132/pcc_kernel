@@ -263,11 +263,160 @@ def test_assessment_config_cannot_close_script():
 
 
 def test_catalog_ids_defaults_and_supported_detectors():
-    assert len(RULE_CATALOG) == len({r['id'] for r in RULE_CATALOG}) == 49
+    assert len(RULE_CATALOG) == len({r['id'] for r in RULE_CATALOG}) == 64
+    hard = {r['id'] for r in RULE_CATALOG if r['group'] == 'data_review'}
+    optional = {r['id'] for r in RULE_CATALOG if r['group'] == 'runtime_note'}
+    assert hard == {'D01', 'D02', 'D08', 'D10'} and optional == {f'D{i:02d}' for i in range(1, 14)} - hard
+    assert hard <= set(DEFAULT_RULES) and not optional.intersection(DEFAULT_RULES)
     assert 'E05' not in DEFAULT_RULES
     assert all(not r['automatic'] for r in RULE_CATALOG if r['id'].startswith('C'))
     assert {r['id'] for r in RULE_CATALOG if r['automatic']} == {x[0] for x in directional_cases()} | {
-        'A07', 'A10', 'A20', 'A21', 'A22', 'E01', 'E02', 'E03', 'E05', 'E06', 'E07', 'E08', 'E09', 'E10', 'E11', 'E12', 'E14', 'E15'}
+        'A07', 'A10', 'A20', 'A21', 'E01', 'E02', 'E03', 'E05', 'E06', 'E07', 'E08', 'E09', 'E10', 'E11', 'E12', 'E14', 'E15', 'E16', 'E17'}
+
+
+def upgrade_pair(snapshot, a, b, sql, *, version="v7.1.9-0.3", reverse=False, meta=META):
+    versions = {"old": "v6.5.12", "new": version}
+    if reverse:
+        a, b = b, a
+        versions["new"], versions["old"] = versions["old"], versions["new"]
+    def with_version(rows, side, query_id):
+        return snapshot(rows, side=side, query_id=query_id, version=versions[side])
+    return assess(with_version, a, b, sql=sql, meta=meta)[0]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("version", ["v7.1.9-0.3", "v8.5.7"])
+def test_numeric_range_estimate_and_transparent_reader(snapshot, version, reverse):
+    def path(est):
+        return reader(node("TableRangeScan", est=est, task="cop[tikv]", access="table:t",
+                           info="range:(10,+inf], keep order:false"), est)
+    item = upgrade_pair(snapshot, path("180"), path("182"), "SELECT * FROM t WHERE id>10", version=version, reverse=reverse)
+    assert evaluate(item["assessment_evidence"], ["E16"])["status"] == "equivalent"
+
+
+@pytest.mark.parametrize("change", ["range", "order", "rows", "stats", "version", "type", "binding", "propagation"])
+def test_static_range_proof_refuses_changed_premises(snapshot, change):
+    info = "range:(10,+inf], keep order:false"
+    a = reader(node("TableRangeScan", est="180", task="cop[tikv]", access="table:t", info=info), "180")
+    b = copy.deepcopy(a)
+    b["est"] = b["children"][0]["est"] = "182"
+    meta = copy.deepcopy(META)
+    leaf = b["children"][0]
+    if change == "range":
+        leaf["info"] = info.replace("10", "11")
+    elif change == "order":
+        leaf["info"] = info.replace("false", "true")
+    elif change == "rows":
+        b["est"] = leaf["est"] = "250"
+    elif change == "stats":
+        meta["d.t"]["stats_ready"] = False
+    elif change == "type":
+        meta["d.t"]["columns"]["id"] = "VARCHAR(32)"
+    elif change == "binding":
+        a["children"][0]["info"] = leaf["info"] = "range: decided by [eq(d.t.id, d.u.id)], keep order:false"
+    elif change == "propagation":
+        b["est"] = "170"
+    version = "v9.0.0" if change == "version" else "v7.1.9-0.3"
+    item = upgrade_pair(snapshot, a, b, "SELECT * FROM t WHERE id>10", version=version, meta=meta)
+    assert evaluate(item["assessment_evidence"], ["E16"])["status"] == "review"
+
+
+@pytest.mark.parametrize("mutation", ["", "predicate", "input", "stats", "volatile"])
+def test_integer_filter_output_is_not_scan_work(snapshot, mutation):
+    a = reader(node("Selection", scan(), est="0", task="cop[tikv]", info="eq(d.t.a, 1234)"), "0")
+    b = copy.deepcopy(a)
+    filt = b["children"][0]
+    b["est"] = filt["est"] = "2"
+    if mutation == "predicate":
+        filt["info"] = "eq(d.t.a, 999)"
+    elif mutation == "input":
+        filt["children"][0]["est"] = "20000"
+    elif mutation == "stats":
+        filt["children"][0]["info"] += ", stats:pseudo"
+    elif mutation == "volatile":
+        a["children"][0]["info"] = filt["info"] = "eq(rand(), 1)"
+    item = upgrade_pair(snapshot, a, b, "SELECT id FROM t WHERE a=1234")
+    assert evaluate(item["assessment_evidence"], ["E16"])["status"] == ("review" if mutation else "equivalent")
+
+
+@pytest.mark.parametrize("mutation", ["", "one_row", "global", "expression"])
+def test_zero_input_grouped_aggregate(snapshot, mutation):
+    source = node("TableDual", est="0", info="rows:0")
+    info = "group by:d.t.a, funcs:firstrow(d.t.a)->d.t.a"
+    if mutation == "global":
+        info = "funcs:count(1)->Column#4"
+    a = node("HashAgg", source, est="1", info=info)
+    b = copy.deepcopy(a)
+    b["op"] = "StreamAgg"
+    b["children"][0]["est"] = "1"
+    if mutation == "one_row":
+        b["children"][0]["info"] = "rows:1"
+    elif mutation == "expression":
+        b["info"] = info.replace("firstrow", "max")
+    item = upgrade_pair(snapshot, a, b, "SELECT DISTINCT a FROM t WHERE id>20 AND id<10")
+    assert evaluate(item["assessment_evidence"], ["E11", "E17"])["status"] == ("review" if mutation else "equivalent")
+
+
+@pytest.mark.parametrize("mutation", ["", "frame", "rank", "input", "sort", "stats"])
+def test_ordered_window_estimates_require_identical_ordered_row_number(snapshot, mutation):
+    index = node("IndexFullScan", est="100", task="cop[tikv]", access="table:t, index:idx_a(a)", info="keep order:true")
+    info = "row_number()->Column#7 over(partition by d.t.a order by d.t.id rows between current row and current row)"
+    a = node("Projection", node("Window", node("IndexReader", index, est="100"), est="100", info=info),
+             est="100", info="d.t.id, Column#7")
+    b = copy.deepcopy(a)
+    win = b["children"][0]
+    win["op"] = "OrderedWindow"
+    leaf = win["children"][0]["children"][0]
+    if mutation == "frame":
+        win["info"] = info.replace("current row", "unbounded preceding", 1)
+    elif mutation == "rank":
+        a["children"][0]["info"] = win["info"] = info.replace("row_number()", "rank()")
+    elif mutation == "input":
+        leaf["info"] = "keep order:false"
+    elif mutation == "sort":
+        win["children"] = (node("Sort", win["children"][0], info="d.t.id", est="100"),)
+    elif mutation == "stats":
+        leaf["info"] += ", stats:partial[a:unInitialized]"
+    item = upgrade_pair(snapshot, a, b, "SELECT id, ROW_NUMBER() OVER (PARTITION BY a ORDER BY id) FROM t")
+    assert evaluate(item["assessment_evidence"], ["A22"])["status"] == "review"
+    cards = {r["rule_id"] for r in item["assessment_evidence"]["mandatory_reviews"]}
+    assert "D09" in {r["rule_id"] for r in item["assessment_evidence"]["runtime_notes"]}
+    assert ("D08" in cards) == (not mutation)
+    assert any(m["rule_id"] == "A22" for m in item["assessment_evidence"]["matches"]) == (not mutation)
+    if not mutation:
+        model = next(m["model"] for m in item["assessment_evidence"]["matches"] if m["rule_id"] == "A22")
+        assert model["old_score"] == model["new_score"] and any("缓冲" in s for s in model["new"]["assumptions"])
+
+
+@pytest.mark.parametrize("mutation", ["", "offset", "sort_key", "range", "prefix_type", "untrusted"])
+def test_ordered_index_limit_accounts_for_merging_ranges(snapshot, mutation):
+    spans = "range:[1,1], [5,5], [20,20], keep order:"
+    if mutation == "range":
+        spans = spans.replace("[5,5]", "[4,5]")
+    def index(ordered):
+        return node("IndexRangeScan", est="30", task="cop[tikv]", access="table:t, index:ia(a)",
+                    info=spans + ("true" if ordered else "false"))
+    key = "a" if mutation == "sort_key" else "id"
+    a = node("TopN", node("IndexReader", index(False), est="30"), info=f"d.t.{key}, offset:100, count:10", est="10")
+    local = node("Limit", index(True), est="30", task="cop[tikv]", info="offset:0, count:" + ("111" if mutation == "offset" else "110"))
+    b = node("Limit", node("IndexReader", local, est="30"), est="10", info="offset:100, count:10")
+    meta = copy.deepcopy(META)
+    if mutation == "prefix_type":
+        meta["d.t"]["columns"]["a"] = "VARCHAR(18)"
+    elif mutation == "untrusted":
+        meta["d.t"]["stats_ready"] = False
+    sql = f"SELECT id,a FROM t WHERE a IN (1,5,20) ORDER BY {key} LIMIT 10 OFFSET 100"
+    item = upgrade_pair(snapshot, a, b, sql, meta=meta)
+    matches = [m for m in item["assessment_evidence"]["matches"] if m["rule_id"] == "A22"]
+    if mutation:
+        assert not matches and item["assessment"]["status"] == "review"
+    else:
+        assert len(matches) == 1
+        assert any("3 段" in text for text in matches[0]["model"]["new"]["assumptions"])
+        inverse = upgrade_pair(snapshot, a, b, sql, meta=meta, reverse=True)
+        rev = next(m for m in inverse["assessment_evidence"]["matches"] if m["rule_id"] == "A22")
+        assert rev["model"]["old_score"] == matches[0]["model"]["new_score"]
+        assert rev["model"]["new_score"] == matches[0]["model"]["old_score"]
 
 
 def test_browser_and_python_decisions_match(snapshot):

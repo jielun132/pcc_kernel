@@ -93,12 +93,19 @@ def prepare_explain(db, sql, parameters, format, check_cancelled=lambda: None):
     check_cancelled()
     db.query("PREPARE pcc_explain FROM %s", (f"EXPLAIN FORMAT='{format}' " + sql,))
     warnings = db.records("SHOW WARNINGS")
-    names = []
-    for index, (expression, value) in enumerate(bindings):
+    names = [f"@pcc_arg_{index}" for index in range(len(bindings))]
+    index = 0
+    while index < len(bindings):
         check_cancelled()
-        name = f"@pcc_arg_{index}"
-        db.query(f"SET {name} = {expression}", (value,))
+        end = index + 1
+        # Group only range-checked integers. Arbitrary strings/binary values and
+        # coercion-sensitive types keep their individual packet and warning check.
+        if parameters[index]["type"] in {"int", "uint"}:
+            while end < min(index + 32, len(bindings)) and parameters[end]["type"] in {"int", "uint"}:
+                end += 1
+        assignments = ", ".join(f"{names[i]} = {bindings[i][0]}" for i in range(index, end))
+        db.query("SET " + assignments, tuple(value for _, value in bindings[index:end]))
         if db.records("SHOW WARNINGS"):
             raise PCCError("PARAMETER_COERCION", "参数绑定产生警告，不能保证参数样例类型和值完整")
-        names.append(name)
+        index = end
     return "EXECUTE pcc_explain" + (" USING " + ",".join(names) if names else ""), warnings

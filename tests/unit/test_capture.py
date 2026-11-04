@@ -45,6 +45,42 @@ class FakeDB:
         return []
 
 
+def test_batched_context_read_preserves_missing_names_and_case():
+    from pcc_tool.capture.connection import Database
+    db = Database({"host": "fake", "user": "reader"})
+    calls = []
+    def query(sql, params):
+        calls.append((sql, params))
+        return [], [["TIME_ZONE", "+08:00"], ["sql_mode", ""]]
+    db.query = query
+    names = ("sql_mode", "time_zone", "old_version_missing")
+    assert db.variables(names) == {"sql_mode": "", "time_zone": "+08:00", "old_version_missing": None}
+    assert db.variables(()) == {} and len(calls) == 1 and calls[0][1] == names
+
+
+def test_shared_long_guard_checks_exact_text_permissions_and_parameters(monkeypatch):
+    from pcc_tool.capture import explain
+    guard = explain.CaptureGuard()
+    calls = []
+    original = explain.guard_sql
+    def checked(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(explain, "guard_sql", checked)
+    text = "/*" + "x" * 33000 + "*/ SELECT 1"
+    q = QueryCase.create(text, "app")
+    guard.check(q)
+    guard.check(q)
+    assert len(calls) == 1
+    q.parameters = [{"type": "int", "value": "1"}]
+    with pytest.raises(PCCError):
+        guard.check(q)
+    q.parameters, q.sql_text = None, text + "; DROP DATABASE app"
+    with pytest.raises(PCCError):
+        guard.check(q)
+    assert len(calls) == 3
+
+
 def test_original_sql_and_warning_order():
     FakeDB.calls = []
     text = "SELECT /*+ HASH_JOIN(a,b) */ * FROM a JOIN b ON a.id=b.id"

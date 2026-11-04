@@ -55,6 +55,7 @@ def main():
     shutil.copytree(ROOT / "docs", target / "docs",
                     ignore=shutil.ignore_patterns("test-report-*.md", "sql-coverage-report-*.md"))
     shutil.copytree(ROOT / "examples", target / "examples")
+    shutil.copy2(ROOT / "examples/pcc.example.json", target / "pcc.json")
     shutil.copy2(ROOT / "README.md", target / "README.md")
     shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", target / "THIRD_PARTY_NOTICES.md")
     for name in ("LICENSE", "NOTICE", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md"):
