@@ -1,13 +1,16 @@
-# PCC 0.1.6 操作步骤
+# PCC 0.1.7 操作步骤
 
 准备三个独立环境：`prod` 为采集源，`old` 和 `new` 为升级前后的临时集群。演示造数使用独立的模拟生产集群。操作机需要 MySQL 8 客户端；PCC Linux 安装包自带 Python 和应用依赖。
 
-**已安装上一份 0.1.6 时**，先退出旧菜单。采集计划进行中可按一次 Ctrl+C，等回到菜单后输入 `0`。把新包和同名校验文件放在原安装目录的上一级，在该目录执行以下命令，保留现场配置和任务目录：
+**从 0.1.6 升级时**，先退出旧菜单。采集计划进行中可按一次 Ctrl+C，等回到菜单后输入 `0`。把新包和同名校验文件放在原安装目录的上一级，在该目录执行以下命令。将文件更新到原目录，保留现场配置和任务的原有路径；若原目录改过名，替换下面两处 `pcc-core-0.1.6-linux-x86_64`：
 
 ```bash
-sha256sum -c pcc-core-0.1.6-linux-x86_64.tar.gz.sha256
-tar -xzf pcc-core-0.1.6-linux-x86_64.tar.gz --exclude='pcc-core-0.1.6-linux-x86_64/pcc.json'
+sha256sum -c pcc-core-0.1.7-linux-x86_64.tar.gz.sha256
+tar -xzf pcc-core-0.1.7-linux-x86_64.tar.gz \
+  --directory=pcc-core-0.1.6-linux-x86_64 --strip-components=1 \
+  --exclude='pcc-core-0.1.7-linux-x86_64/pcc.json'
 cd pcc-core-0.1.6-linux-x86_64
+./pcc --version
 ./pcc
 ```
 
@@ -28,6 +31,8 @@ cd pcc-core-0.1.6-linux-x86_64
 
 ## 用已有固定材料复测 413 条
 
+已有的 0.1.6 固定材料可继续使用，不需要更改材料版本或内容。
+
 1. 已取得固定材料时，在安装目录解压 `pcc-demo-reference-0.1.6.tar.gz`。命令为 `tar -xzf pcc-demo-reference-0.1.6.tar.gz`。
 2. 运行 `./pcc`，选择 `3`，输入 `pcc-demo-reference-0.1.6/bundle`。
 3. 第一次选 `1`，核对两个隔离目标和库名，输入 `IMPORT`。等待“普通 EXPLAIN 预热”和“正式采集”两轮完成。两端都已导入后，主菜单 `4` 可重采。中断后仍选 `4` 继续。
@@ -37,12 +42,12 @@ cd pcc-core-0.1.6-linux-x86_64
 
 ## 1. 解压并配置
 
-把 0.1.6 安装包和同名 `.sha256` 文件放到操作机同一目录，执行：
+把 0.1.7 安装包和同名 `.sha256` 文件放到操作机同一目录，执行：
 
 ```bash
-sha256sum -c pcc-core-0.1.6-linux-x86_64.tar.gz.sha256
-tar -xzf pcc-core-0.1.6-linux-x86_64.tar.gz
-cd pcc-core-0.1.6-linux-x86_64
+sha256sum -c pcc-core-0.1.7-linux-x86_64.tar.gz.sha256
+tar -xzf pcc-core-0.1.7-linux-x86_64.tar.gz
+cd pcc-core-0.1.7-linux-x86_64
 vi pcc.json
 ```
 

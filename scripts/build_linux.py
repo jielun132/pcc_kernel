@@ -54,7 +54,8 @@ def main():
     shutil.copytree(output / "frozen/pcc", target)
     shutil.copytree(ROOT / "docs", target / "docs",
                     ignore=shutil.ignore_patterns("test-report-*.md", "sql-coverage-report-*.md"))
-    shutil.copytree(ROOT / "examples", target / "examples")
+    shutil.copytree(ROOT / "examples", target / "examples", ignore=shutil.ignore_patterns("demo-result"))
+    run(sys.executable, ROOT / "scripts/make_demo.py", "--out", target / "examples/demo-result")
     shutil.copy2(ROOT / "examples/pcc.example.json", target / "pcc.json")
     shutil.copy2(ROOT / "README.md", target / "README.md")
     shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", target / "THIRD_PARTY_NOTICES.md")

@@ -30,3 +30,18 @@ profiles.json
 /demo-output/
 /pcc.json
 /pcc-output/
+
+# Generated synthetic demo; rebuilt from scripts/make_demo.py when packaging.
+/examples/demo-result/
+
+# Local coverage reports and downloaded/extracted release assets.
+.coverage
+.coverage.*
+/htmlcov/
+/coverage.xml
+/pcc-core-*-linux-*/
+/pcc-core-*-linux-*.tar.gz
+/pcc-core-*-linux-*.tar.gz.sha256
+/pcc_tool-*.whl
+/pcc_tool-*.tar.gz
+/SHA256SUMS
