@@ -18,6 +18,14 @@ python3.11 -m venv .venv
 
 `src/pcc_tool/` 为 CLI/SDK 共用核心；`tests/unit/` 为离线测试；`tests/integration/` 为需要显式启用的真实集群测试；`tests/fixtures/` 只保存合成数据或脱敏计划。CI 只运行离线检查，不提供数据库凭据。
 
+仓库保留源码、测试及固定案例、配置模板、构建脚本、依赖锁文件和公开文档。`src/pcc_tool/demo_data/` 是终端菜单及 SDK 生成 413 条案例所需的运行时资源，与固定用例库逐字校验，不能作为临时产物忽略。
+
+生成的报告、构建包、缓存、私有连接配置和本地交接材料由 `.gitignore` 排除。`examples/demo-result/` 是可重建的合成演示，不纳入 Git 或源码分发包；Linux 安装包在构建时生成这份演示。需要在本地查看时，使用新的输出目录：
+
+```bash
+.venv/bin/python scripts/make_demo.py --out demo-output/preview
+```
+
 ## 修改约定
 
 - 保留 SQL、Hint、参数和原始计划证据。不要用 AST 重写待测 SQL 来绕过兼容性问题。
