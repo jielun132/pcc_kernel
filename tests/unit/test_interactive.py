@@ -146,9 +146,11 @@ def test_config_paths_and_local_time(config):
 
 
 def test_password_reused_and_removed_not_written(config, monkeypatch):
+    from contextlib import nullcontext
     monkeypatch.delenv("PCC_DB_PASSWORD", raising=False)
     calls = []
     monkeypatch.setattr(interactive.getpass, "getpass", lambda p: calls.append(p) or "test-only-secret")
+    monkeypatch.setattr(interactive, "Database", lambda *a: nullcontext())
     menu = interactive.Menu(config)
     menu.password(("prod", "old", "new"))
     assert len(calls) == 1 and os.environ["PCC_DB_PASSWORD"] == "test-only-secret"
@@ -156,6 +158,105 @@ def test_password_reused_and_removed_not_written(config, monkeypatch):
     assert "test-only-secret" not in config.read_text() + menu.index_path.read_text()
     menu.close()
     assert "PCC_DB_PASSWORD" not in os.environ
+
+
+def test_password_blank_requires_input_then_other_profile_can_reuse(config, monkeypatch, capsys):
+    from contextlib import nullcontext
+    menu = interactive.Menu(config)
+    menu.profiles["prod"]["password_env"] = "looks_like_a_secret_123"
+    menu.profiles["old"]["password_env"] = "PCC_OTHER_PASSWORD"
+    for ref in ("looks_like_a_secret_123", "PCC_OTHER_PASSWORD"):
+        monkeypatch.delenv(ref, raising=False)
+    prompts, logins = [], []
+    replies = iter(["", "test-only-input", ""])
+    monkeypatch.setattr(interactive.getpass, "getpass", lambda p: prompts.append(p) or next(replies))
+    def connect(profile):
+        logins.append(os.environ[profile["password_env"]])
+        assert logins[-1] == "test-only-input"
+        return nullcontext()
+    monkeypatch.setattr(interactive, "Database", connect)
+    try:
+        menu.password(("prod", "old"))
+        menu.password(("prod",))
+        menu.save()
+        output = "".join(prompts) + capsys.readouterr().out + menu.index_path.read_text()
+        assert len(prompts) == 3 and len(logins) == 3
+        assert "尚无可复用" in output and "回车复用" in prompts[-1]
+        assert "looks_like_a_secret_123" not in output and "test-only-input" not in output
+        assert "PCC_OTHER_PASSWORD" not in output
+    finally:
+        menu.close()
+    assert "looks_like_a_secret_123" not in os.environ and "PCC_OTHER_PASSWORD" not in os.environ
+
+
+def test_password_auth_failure_retries_without_reusing_rejected_value(config, monkeypatch, capsys):
+    from pcc_tool.capture.connection import DBConnectError
+    menu = interactive.Menu(config)
+    monkeypatch.setenv("PCC_DB_PASSWORD", "test-only-rejected")
+    replies = iter(["", "test-only-corrected"])
+    prompts, attempts = [], []
+    monkeypatch.setattr(interactive.getpass, "getpass", lambda p: prompts.append(p) or next(replies))
+    class Login:
+        def __init__(self, profile):
+            self.value = os.environ[profile["password_env"]]
+        def __enter__(self):
+            attempts.append(self.value)
+            if self.value != "test-only-corrected":
+                raise DBConnectError(1045)
+        def __exit__(self, *_):
+            pass
+    monkeypatch.setattr(interactive, "Database", Login)
+    try:
+        menu.password(("prod",))
+        assert attempts == ["test-only-rejected", "test-only-corrected"]
+        assert os.environ["PCC_DB_PASSWORD"] == "test-only-corrected"
+        output = "".join(prompts) + capsys.readouterr().out
+        assert "1045" in output and "尚无可复用" in output
+        assert not any(s in output for s in ("PCC_DB_PASSWORD", "test-only-rejected", "test-only-corrected"))
+    finally:
+        menu.close()
+    assert os.environ["PCC_DB_PASSWORD"] == "test-only-rejected"
+
+
+def test_password_refuses_echoing_terminal(config, monkeypatch):
+    import warnings
+    menu = interactive.Menu(config)
+    monkeypatch.delenv("PCC_DB_PASSWORD", raising=False)
+    def unsafe_prompt(_):
+        warnings.warn("No hidden terminal", interactive.getpass.GetPassWarning)
+        pytest.fail("Echoing fallback was allowed")
+    monkeypatch.setattr(interactive.getpass, "getpass", unsafe_prompt)
+    with pytest.raises(PCCError) as exc:
+        menu.password(("prod",))
+    assert exc.value.code == "SECURE_INPUT_UNAVAILABLE"
+    assert "PCC_DB_PASSWORD" not in os.environ
+
+
+@pytest.mark.parametrize("configured,answer,expected", [(["demo"], "", ["demo"]), (["demo"], "*", []),
+                                                       ([], "", []), (["demo"], "one, two", ["one", "two"])])
+def test_summary_schema_default_and_explicit_all(config, monkeypatch, configured, answer, expected):
+    menu = interactive.Menu(config)
+    menu.cfg["schemas"] = configured
+    replies = iter(["2026-11-11 17:27:40", "2026-11-11 17:28:24", answer])
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda p: prompts.append(p) or next(replies))
+    monkeypatch.setattr(menu, "password", lambda *a: None)
+    monkeypatch.setattr(menu, "continue_task", lambda: None)
+    menu.start(True)
+    assert read_json(Path(menu.state["task"]) / "task.json")["options"]["schemas"] == expected
+    assert "留空为全部" not in prompts[-1] and "*" in prompts[-1]
+    if configured:
+        assert "回车用默认" in prompts[-1] and "[demo]" in prompts[-1]
+
+
+def test_summary_rejects_mixed_wildcard_before_login(config, monkeypatch):
+    menu = interactive.Menu(config)
+    replies = iter(["2026-11-11 17:27:40", "2026-11-11 17:28:24", "demo,*"])
+    monkeypatch.setattr("builtins.input", lambda p: next(replies))
+    monkeypatch.setattr(menu, "password", lambda *a: pytest.fail("Logged in with ambiguous schema selection"))
+    with pytest.raises(PCCError) as exc:
+        menu.start(True)
+    assert exc.value.code == "INVALID_CONFIG"
 
 
 def fake_databases(monkeypatch, *, existing=(), shared=False):
@@ -198,6 +299,77 @@ def test_preflight_rejects_nonempty_or_unisolated(config, monkeypatch, kind):
         profiles["old"]["host"] = profiles["prod"]["host"]
     with pytest.raises(PCCError):
         workflow.inspect_targets(profiles, "prod", "old", "new", ["demo"], ["old", "new"])
+
+
+def archived_source_identity():
+    nodes = [{"TYPE": "tidb", "INSTANCE": "prod.invalid", "STATUS_ADDRESS": "prod.invalid"},
+             {"TYPE": "tidb", "INSTANCE": "prod-second.invalid", "STATUS_ADDRESS": "prod-second.invalid"},
+             {"TYPE": "pd", "INSTANCE": "prod-pd.invalid", "STATUS_ADDRESS": "prod-pd.invalid"}]
+    return {"verified": True, "node": nodes[0], "cluster_nodes": nodes}
+
+
+def test_fixed_preflight_uses_archive_without_live_source_config(config, monkeypatch):
+    profiles = interactive.load_profiles(str(config))
+    # Even looking up the source connection is unnecessary for a fixed bundle.
+    profiles.pop("prod")
+    reads = fake_databases(monkeypatch)
+    versions = workflow.inspect_targets(profiles, "prod", "old", "new", ["demo"], ["old", "new"], archived_source_identity())
+    assert set(versions) == {"old", "new"}
+    assert reads == [("old.invalid", ("demo",)), ("new.invalid", ("demo",))]
+
+
+@pytest.mark.parametrize("identity", [{}, {"verified": True}, {"verified": False},
+                                     {"verified": True, "node": {}, "cluster_nodes": None}])
+def test_fixed_preflight_missing_source_identity_never_falls_back_to_source(config, monkeypatch, identity):
+    profiles = interactive.load_profiles(str(config))
+    monkeypatch.setattr(workflow, "Database", lambda *a: pytest.fail("Connected before validating archive identity"))
+    with pytest.raises(PCCError) as exc:
+        workflow.inspect_targets(profiles, "prod", "old", "new", ["demo"], ["old", "new"], identity)
+    assert exc.value.code == "SOURCE_IDENTITY_MISSING"
+
+
+@pytest.mark.parametrize("kind", ["source_second_node", "source_pd", "target_overlap", "nonempty", "role", "version", "endpoint"])
+def test_fixed_preflight_preserves_import_isolation_checks(config, monkeypatch, kind):
+    profiles = interactive.load_profiles(str(config))
+    fake_databases(monkeypatch, existing=["new.invalid"] if kind == "nonempty" else [], shared=kind == "target_overlap")
+    identity = archived_source_identity()
+    if kind == "source_second_node":
+        identity["cluster_nodes"][1]["STATUS_ADDRESS"] = "new.invalid"
+    if kind == "source_pd":
+        base = workflow.Database
+        class OverlappingPD(base):
+            def cluster_info(self):
+                return [*super().cluster_info(), {"TYPE": "pd", "INSTANCE": "prod-pd.invalid"}]
+        monkeypatch.setattr(workflow, "Database", OverlappingPD)
+    if kind == "role":
+        profiles["old"]["role"] = "source"
+    if kind == "version":
+        profiles["new"].pop("expected_version")
+    if kind == "endpoint":
+        profiles["new"]["host"] = profiles["old"]["host"]
+    with pytest.raises(PCCError) as exc:
+        workflow.inspect_targets(profiles, "prod", "old", "new", ["demo"], ["old", "new"], identity)
+    expected = "TARGET_SCHEMA_EXISTS" if kind == "nonempty" else "VERSION_REQUIRED" if kind == "version" else "TARGET_NOT_ISOLATED"
+    assert exc.value.code == expected
+
+
+def test_fixed_menu_auto_import_requests_only_target_passwords(config, material_bundle, monkeypatch):
+    root = Path(material_bundle.path)
+    write_json(root / "context.json", {"status_identity": archived_source_identity()})
+    finalize(root, material_bundle.manifest)
+    menu = interactive.Menu(config)
+    logins, imports = [], []
+    monkeypatch.setattr(menu, "password", lambda names: logins.append(names))
+    monkeypatch.setattr(api, "export", lambda *a, **k: pytest.fail("Fixed materials reconnected to source"))
+    fake_databases(monkeypatch)
+    monkeypatch.setattr(interactive, "mysql_command", lambda *a: [])
+    monkeypatch.setattr(interactive, "import_target", lambda prep, bundle, target, *a: imports.append(target))
+    replies = iter([str(root), "3", "IMPORT"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(replies))
+    menu.start(False)
+    assert logins == [("old", "new")] and imports == ["old", "new"]
+    state = read_json(Path(menu.state["task"]) / "task.json")
+    assert state["imported"] == ["old", "new"] and state["fixed_bundle_hash"]
 
 
 def test_import_validates_bundle_and_passes_password_only_in_environment(config, material_bundle, monkeypatch, tmp_path):
@@ -265,13 +437,16 @@ def test_fixed_bundle_reuses_verified_inputs_without_export(config, material_bun
     assert exc.value.code == "HASH_MISMATCH"
 
 
-def test_fixed_material_warmup_resumes_and_runs_only_once(config, material_bundle, tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["fixed", "summary", "sql_file"])
+def test_material_warmup_resumes_and_runs_only_once(config, material_bundle, tmp_path, monkeypatch, mode):
     import shutil
     menu = interactive.Menu(config)
     task = tmp_path / "fixed"
     shutil.copytree(material_bundle.path, task / "bundle")
     state = {"profiles_hash": interactive.digest(menu.profiles), "targets": ["old", "new"], "source": "prod",
-             "options": {}, "imported": ["old", "new"], "fixed_bundle_hash": interactive.digest(material_bundle.manifest)}
+             "options": {"from_summary": True} if mode == "summary" else {}, "imported": ["old", "new"]}
+    if mode == "fixed":
+        state["fixed_bundle_hash"] = interactive.digest(material_bundle.manifest)
     write_json(task / "task.json", state)
     menu.state["task"] = str(task)
     monkeypatch.setattr(menu, "password", lambda *a: None)
@@ -279,6 +454,8 @@ def test_fixed_material_warmup_resumes_and_runs_only_once(config, material_bundl
     def collect(function, request, **kwargs):
         assert function is api.compare
         out = Path(request.out)
+        assert request.warmup_only == (out.name == "warmup")
+        assert request.stats_retries == (0 if request.warmup_only else 5)
         calls.append((out.name, request.resume))
         if len(calls) == 1:
             (task / ".warmup.partial").mkdir()
@@ -376,11 +553,11 @@ def test_import_both_then_compare_later_without_reimport(config, material_bundle
     restarted = interactive.Menu(config)
     calls = []
     def compare(function, request, **kwargs):
-        calls.append(function)
+        calls.append((function, request.warmup_only, request.stats_retries))
         return SimpleNamespace(summary={}, exit_code=0, run_status="completed")
     monkeypatch.setattr(restarted, "core", compare)
     restarted.continue_task()
-    assert calls == [api.compare] and imported == ["old", "new"]
+    assert calls == [(api.compare, True, 0), (api.compare, False, 5)] and imported == ["old", "new"]
 
 
 def test_terminal_color_respects_output_and_environment(monkeypatch):

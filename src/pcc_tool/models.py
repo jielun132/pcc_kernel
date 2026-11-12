@@ -13,7 +13,7 @@ from typing import Any
 CONTRACT_VERSION = "1"
 DEFAULT_CONCURRENCY = 8
 VERSIONS = dict(contract_version="1", ir_version="1", normalizer_version="2",
-                matcher_version="3", diff_version="2", guard_version="3", materials_version="1", rules_version="1", assessment_version="6")
+                matcher_version="3", diff_version="2", guard_version="3", materials_version="1", rules_version="1", assessment_version="7")
 METRICS = ("execution_count", "total_latency", "average_latency", "total_keys", "average_keys")
 
 
@@ -193,6 +193,7 @@ class ComparisonResult:
     issues: list[dict]
     run_status: str
     output_dir: str = ""
+    assessment_policy: dict = field(default_factory=dict)
 
     @property
     def exit_code(self) -> int:
@@ -217,6 +218,9 @@ class CompareRequest:
     stats_retries: int = 1
     binding_policy: str = "exclude"
     session: dict = field(default_factory=dict)
+    warmup_only: bool = False
+    rules_config: str | None = None
+    rule_profile: str | None = None
 
 
 @dataclass
@@ -224,6 +228,8 @@ class DiffRequest:
     result_dir: str
     out: str
     resume: bool = False
+    rules_config: str | None = None
+    rule_profile: str | None = None
 
 
 @dataclass

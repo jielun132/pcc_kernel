@@ -1,7 +1,7 @@
 // Exercise the shipped report script with a minimal DOM; no rendering claims.
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
 const {execFileSync}=require('node:child_process');
-const shipped=JSON.parse(execFileSync(process.argv[2]||'python',['-c','import json; from pcc_tool.render.navigation import SCRIPT; from pcc_tool.render.assessment import ASSESSMENT_SCRIPT; from pcc_tool.plan.rule_catalog import *; print(json.dumps(dict(script=ASSESSMENT_SCRIPT+SCRIPT, config=dict(version=ASSESSMENT_VERSION, rules=RULE_CATALOG, selected=DEFAULT_RULES, thresholds=DEFAULT_THRESHOLDS, report_fingerprint="test-report", rules_fingerprint="test-rules"))))'],{encoding:'utf8'}));
+const shipped=JSON.parse(execFileSync(process.argv[2]||'python',['-c','import json; from pcc_tool.render.navigation import SCRIPT; from pcc_tool.render.assessment import ASSESSMENT_SCRIPT; from pcc_tool.plan.rule_config import load_policy; print(json.dumps(dict(script=ASSESSMENT_SCRIPT+SCRIPT, config=dict(load_policy(), report_fingerprint="test-report"))))'],{encoding:'utf8'}));
 let script=shipped.script, config=shipped.config;
 class Element{
   constructor(tag='div'){this.tagName=tag.toUpperCase();this.children=[];this.dataset={};this.attributes={};this.listeners={};this.parentElement=null;this.value='';this.hidden=false;this.checked=false;this.className='';this._text='';}
@@ -57,15 +57,17 @@ if(!process.argv[3])records[0].assessmentEvidence.mandatory_reviews=[{rule_id:'D
 if(!process.argv[3])records[3].assessmentEvidence.runtime_notes=[{rule_id:'D05',reason:'第 K 行位置未知',check:'用有代表性的数据核对扫描量'}];
 const archivedAssessments=records.map(r=>r.assessment?JSON.parse(JSON.stringify(r.assessment)):null);
 nodes['report-data'].textContent=JSON.stringify(records);
-for(const id of ['assessment-config','assessment-panel','assessment-state','assessment-counts','run-assessment','export-assessment-json','export-assessment-csv',...Object.keys(config.thresholds).map(k=>'threshold-'+k)]){
+for(const id of ['assessment-config','assessment-panel','assessment-state','assessment-counts','run-assessment','export-assessment-json','export-assessment-csv','rule-profile','profile-state','review-state','review-filter','save-reviews','import-reviews',...Object.keys(config.thresholds).map(k=>'threshold-'+k)]){
   const n=new Element(id.startsWith('threshold')?'input':id.startsWith('export-')||id==='run-assessment'?'button':'div');n.id=id;nodes[id]=n;doc.append(n);
 }
 nodes['assessment-config'].textContent=JSON.stringify(config);
+nodes['rule-profile'].value=config.profile_id;
 Object.entries(config.thresholds).forEach(([k,v])=>nodes['threshold-'+k].value=v);
 for(const rule of config.rules){const c=new Element('input');c.dataset.ruleId=rule.id;c.checked=config.selected.includes(rule.id);c.disabled=rule.group==='data_review';doc.append(c);}
 for(const key of ['default','runtime','all','none']){const b=new Element('button');b.dataset.rulePreset=key;doc.append(b);}
-let downloaded;
+let downloaded;const storage=new Map();
 const sandbox={document:doc,navigator:{clipboard:{writeText:async text=>{copied=text;}}},location:{hash:''},window:{addEventListener(){}},console,
+  localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)},
   Blob,URL:{createObjectURL:blob=>{downloaded=blob;return 'blob:test';},revokeObjectURL(){}},setTimeout:f=>f()};
 doc.body=doc;
 vm.createContext(sandbox);vm.runInContext(script,sandbox);
@@ -102,8 +104,8 @@ async function checks(){
   const evidenceLink=new Element('a');evidenceLink.href='#query-1-diff-2';doc.append(evidenceLink);click(evidenceLink);assert.equal(doc.getElementById('query-1'),card);assert.ok(card.querySelectorAll('.node-details').every(d=>d.open));
   toggle.checked=false;toggle.fire('change');assert.equal(card.querySelectorAll('.node-details')[0].open,false);assert.equal(card.querySelectorAll('.node-details')[1].open,true);
   const button=card.querySelectorAll('button').find(b=>b.dataset.copyPlan==='both');await read('copyPlan')(button);assert.equal(copied,`old · 升级前\n${records[0].oldPlan||'没有可用计划'}\n\nnew · 升级后\n${records[0].newPlan||'没有可用计划'}`);
-  sandbox.navigator.clipboard.writeText=async()=>{throw new Error('denied');};await read('copyPlan')(button);assert.match(card.querySelector('.copy-status').textContent,/已复制/);assert.equal(card.querySelector('textarea'),null);
-  fallback=false;await read('copyPlan')(button);assert.match(card.querySelector('.copy-status').textContent,/Cmd\+C/);assert.equal(card.querySelector('textarea').value,copied);assert.ok(card.querySelector('textarea').selected);
+  sandbox.navigator.clipboard.writeText=async()=>{throw new Error('denied');};await read('copyPlan')(button);assert.match(card.querySelector('.copy-status').textContent,/已复制/);assert.equal(card.querySelector('.copy-manual'),null);
+  fallback=false;await read('copyPlan')(button);assert.match(card.querySelector('.copy-status').textContent,/Cmd\+C/);assert.equal(card.querySelector('.copy-manual').value,copied);assert.ok(card.querySelector('.copy-manual').selected);
   // Rule selection never changes the original status, nor inherits group decisions.
   const original=JSON.stringify(records.map(r=>r.status)),changed=records.filter(r=>r.status==='changed').length;
   const inScope=records.filter(r=>r.status==='changed'||r.assessmentEvidence.mandatory_reviews?.length).length;
@@ -161,6 +163,45 @@ async function checks(){
   assert.ok(read(`PCCAssessment.csv({...assessment.payload(),results:[{...assessment.payload().results[0],schema:'=1+1'}]})`).includes('"\'=1+1"'));
   assert.equal(JSON.stringify(records.map(r=>r.status)),original);
   click(metrics[0]);assert.equal(read('filtered.length'),records.length);
+  // Human decisions survive navigation, remain separate, and become stale on policy changes.
+  const jump=n=>{nodes['jump-number'].value=String(n);click(nodes['jump-query']);};jump(1);
+  let detail=doc.getElementById('query-1');
+  const note=detail.querySelector('[data-review-note]');note.value='=HYPERLINK("现场复核")\n<script>literal text</script>';note.fire('input');
+  const verdict=detail.querySelector('[data-review-conclusion]');verdict.value='worse';verdict.fire('change');
+  const checked=detail.querySelector('[data-review-checked]');checked.checked=true;checked.fire('change');
+  let human=JSON.parse(JSON.stringify(read('assessment.payload()')));assert.equal(human.results[0].manual_review.reviewed,true);
+  assert.equal(human.results[0].manual_review.conclusion,'worse');assert.deepEqual(human.results[0].result,initial.results[0].result);
+  assert.equal(storage.size,1);jump(2);jump(1);assert.equal(doc.getElementById('query-1').querySelector('[data-review-note]').value,note.value);
+  const evidenceBasis=read('records[0].reviewBasis');sandbox.originalBasis=evidenceBasis;
+  read('records[0].reviewBasis="different-plan-evidence"');
+  assert.equal(read('assessment.payload().results[0].manual_review.needs_reconfirmation'),true);
+  assert.equal(read('assessment.payload().results[0].manual_review.note'),note.value);
+  read('records[0].reviewBasis=originalBasis');assert.equal(read('assessment.payload().results[0].manual_review.reviewed'),true);
+  click(preset('none'));assert.equal(read('assessment.payload().results[0].manual_review.needs_reconfirmation'),true);
+  assert.equal(doc.getElementById('query-1').querySelector('[data-review-checked]').disabled,true);
+  click(nodes['run-assessment']);assert.equal(read('assessment.payload().results[0].manual_review.reviewed'),false);
+  const confirm=doc.getElementById('query-1').querySelector('[data-review-checked]');confirm.checked=true;confirm.fire('change');
+  click(nodes['save-reviews']);const saved=JSON.parse(await downloaded.text());assert.equal(saved.kind,'PCCManualReview');
+  assert.equal(saved.reviews[0].note,note.value);
+  sandbox.saved=saved;assert.equal(read('PCCReview.validate(saved,configFingerprint,new Set(records.map(r=>r.queryId))).size'.replace('configFingerprint',JSON.stringify(config.report_fingerprint))),1);
+  const previous=read('JSON.stringify(assessment.payload().manual_reviews)');
+  nodes['import-reviews'].files=[{size:100,text:async()=>JSON.stringify({...saved,report_fingerprint:'wrong'})}];
+  await nodes['import-reviews'].listeners.change[0]();assert.equal(read('JSON.stringify(assessment.payload().manual_reviews)'),previous);
+  assert.match(nodes['review-state'].textContent,/不匹配/);
+  nodes['import-reviews'].files=[{size:100,text:async()=>JSON.stringify({...saved,reviews:[...saved.reviews,...saved.reviews]})}];
+  await nodes['import-reviews'].listeners.change[0]();assert.equal(read('JSON.stringify(assessment.payload().manual_reviews)'),previous);
+  nodes['import-reviews'].files=[{size:100,text:async()=>JSON.stringify(saved)}];await nodes['import-reviews'].listeners.change[0]();
+  assert.match(nodes['review-state'].textContent,/已导入 1/);change('review-filter','reviewed');assert.equal(read('filtered.length'),1);
+  click(metrics[0]);assert.equal(read('filtered.length'),records.length);assert.equal(nodes['review-filter'].value,'');
+  click(nodes['export-assessment-csv']);assert.ok((await downloaded.text()).includes("\"'=HYPERLINK"));
+  if(config.profiles?.length>1){change('rule-profile',config.profiles.find(p=>p.id!==config.profile_id).id);
+    assert.equal(read('assessment.isDirty()'),true);click(nodes['run-assessment']);
+    assert.equal(read('assessment.payload().profile_id'),nodes['rule-profile'].value);assert.equal(read('assessment.payload().results[0].manual_review.needs_reconfirmation'),true);}
+  // Browser storage failure is visible, and file export remains usable.
+  sandbox.localStorage.setItem=()=>{throw Error('quota');};jump(1);
+  const changedNote=doc.getElementById('query-1').querySelector('[data-review-note]');changedNote.value+=' more';changedNote.fire('input');
+  assert.match(nodes['review-state'].textContent,/保存不可用/);click(nodes['save-reviews']);assert.equal(JSON.parse(await downloaded.text()).reviews[0].note,changedNote.value);
+  console.log('Manual review, policy staleness, persistence, atomic import validation, filters and safe export passed.');
   console.log(`Rule selection, full-scope recalculation, stale state, thresholds, filters and JSON/CSV exports passed (${changed} changed SQLs).`);
   console.log(`Navigation, paging, schema/plan groups, deferred scopes, deep links and clipboard paths passed (${records.length} SQLs).`);
 }

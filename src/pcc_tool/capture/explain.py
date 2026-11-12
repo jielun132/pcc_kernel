@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 import time
 
@@ -7,6 +8,15 @@ from pcc_tool.capture.connection import Database
 from pcc_tool.capture.guard import guard_sql, quote_identifier, validate_session
 from pcc_tool.capture.parameters import prepare_explain
 from pcc_tool.models import PCCError, PlanSnapshot, QueryCase, now
+
+
+def has_unloaded_stats(snapshot):
+    # Inspect actual operator-info fields, not SQL literals containing these words.
+    from pcc_tool.plan.assessment import split_list, walk
+    from pcc_tool.plan.parser import parse_plan
+    plan = parse_plan(snapshot)
+    return any(re.fullmatch(r"stats\s*:\s*(?:pseudo|partial\[.*\])", part, re.I | re.S)
+               for root in plan.roots for node in walk(root) for part in split_list(node.attributes))
 
 
 class CaptureGuard:
@@ -158,14 +168,13 @@ def capture_plan(query: QueryCase, side: str, profile: dict, *, format="row", se
                     break
                 snapshot.attempts.append({"attempt": attempt + 1, "captured_at": now(), "explain_ms": explain_ms, "columns": snapshot.columns,
                                           "rows": snapshot.rows, "warnings": snapshot.warnings})
-                raw = str(snapshot.rows).lower()
                 warning_text = str(snapshot.warnings).lower()
-                pseudo = "stats:pseudo" in raw or "stats: pseudo" in raw
-                not_ready = pseudo or ("stats" in warning_text and any(w in warning_text for w in ("timeout", "not loaded", "pseudo")))
+                incomplete = has_unloaded_stats(snapshot)
+                not_ready = incomplete or ("stats" in warning_text and any(w in warning_text for w in ("timeout", "not loaded", "pseudo")))
                 if not not_ready:
                     break
                 if attempt == stats_retries:
-                    snapshot.issues.append({"code": "STATS_NOT_READY", "message": "EXPLAIN 使用 pseudo 或统计加载不完整"})
+                    snapshot.issues.append({"code": "STATS_NOT_READY", "message": "EXPLAIN 使用 pseudo / partial 统计，或统计加载超时；保留原始观测等待复查"})
                 elif cancel.wait(min(attempt + 1, 3)):
                     snapshot.capture_status = "skipped"
                     break

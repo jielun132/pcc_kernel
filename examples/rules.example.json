@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "default_profile": "auto",
+  "thresholds": {
+    "min_rows": 1000,
+    "max_ratio_pct": 10,
+    "reduction_pct": 50,
+    "estimate_pct": 10
+  },
+  "cards": {
+    "A01": {
+      "description": "按完整 DDL 和相同主键值核对点查前提。",
+      "review_note": "人工复核后勾选已评审，可在备注中记录业务确认依据。"
+    }
+  },
+  "profiles": [
+    {
+      "id": "tidb-6.5.12-to-8.5.7",
+      "label": "TiDB 6.5.12 → 8.5.7",
+      "old_version": "6.5.12",
+      "new_version": "8.5.7"
+    }
+  ]
+}

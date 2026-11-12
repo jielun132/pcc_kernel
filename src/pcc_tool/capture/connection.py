@@ -235,4 +235,4 @@ def verify_status_identity(db: Database, profile: dict) -> dict:
     reported, expected = release(status.get("version", "")), release(matches[0]["VERSION"])
     if not reported or reported != expected or status.get("git_hash") != matches[0].get("GIT_HASH"):
         raise PCCError("STATUS_IDENTITY_UNVERIFIED", "Status 节点版本与 SQL 集群清单不一致")
-    return {"node": matches[0], "verified": True}
+    return {"node": matches[0], "verified": True, "cluster_nodes": nodes}

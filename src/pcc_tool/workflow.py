@@ -64,28 +64,50 @@ def validate_materials(bundle):
     return sorted(schemas)
 
 
-def inspect_targets(profiles, source, old, new, schemas, pending):
+def cluster_identity(nodes):
+    if not isinstance(nodes, list):
+        raise PCCError("TARGET_IDENTITY_UNKNOWN", "无法确认集群节点身份，拒绝自动导入")
+    identity = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise PCCError("TARGET_IDENTITY_UNKNOWN", "集群节点身份材料无效，拒绝自动导入")
+        kind = str(node.get("TYPE", "")).lower()
+        if kind in {"tidb", "pd"}:
+            address = node.get("STATUS_ADDRESS") or node.get("INSTANCE")
+            if not isinstance(address, str) or not address.strip():
+                raise PCCError("TARGET_IDENTITY_UNKNOWN", "集群节点地址缺失，拒绝自动导入")
+            identity.add((kind, address.lower()))
+    if not identity:
+        raise PCCError("TARGET_IDENTITY_UNKNOWN", "无法确认集群节点身份，拒绝自动导入")
+    return identity
+
+
+def inspect_targets(profiles, source, old, new, schemas, pending, source_identity=None):
     names = (source, old, new)
     if len(set(names)) != 3:
         raise PCCError("TARGET_NOT_ISOLATED", "source、old、new 必须是三个独立环境")
-    chosen = {name: profile_named(profiles, name) for name in names}
+    chosen = {name: profile_named(profiles, name) for name in (names if source_identity is None else (old, new))}
     if any(chosen[name].get("role") != "test" for name in (old, new)):
         raise PCCError("TARGET_NOT_ISOLATED", "导入目标必须明确配置 role=test")
     if any(not p.get("expected_version") for p in chosen.values()):
-        raise PCCError("VERSION_REQUIRED", "自动导入前请为三个环境填写精确 expected_version")
+        raise PCCError("VERSION_REQUIRED", "自动导入前请为需要连接的环境填写精确 expected_version")
     endpoints = {(p["host"].lower(), int(p.get("port", 4000))) for p in chosen.values()}
-    if len(endpoints) != 3:
+    if len(endpoints) != len(chosen):
         raise PCCError("TARGET_NOT_ISOLATED", "三个环境不能使用相同 SQL 地址")
     identities, versions = {}, {}
+    if source_identity is not None:
+        if (not isinstance(source_identity, dict) or source_identity.get("verified") is not True
+                or not isinstance(source_identity.get("node"), dict)
+                or str(source_identity["node"].get("TYPE", "")).lower() != "tidb"
+                or not isinstance(source_identity.get("cluster_nodes"), list)
+                or source_identity["node"] not in source_identity.get("cluster_nodes", [])):
+            raise PCCError("SOURCE_IDENTITY_MISSING", "固定材料缺少完整源集群身份；请用修复版重新导出，或人工导入后选择仅比较")
+        identities[source] = cluster_identity(source_identity["cluster_nodes"])
     # Finish all checks before the first write, including the second target.
     for name, profile in chosen.items():
         with Database(profile) as db:
             versions[name] = db.version()
-            nodes = db.cluster_info()
-            identities[name] = {(str(n["TYPE"]).lower(), str(n.get("STATUS_ADDRESS") or n["INSTANCE"]))
-                                for n in nodes if str(n["TYPE"]).lower() in {"tidb", "pd"}}
-            if not identities[name]:
-                raise PCCError("TARGET_IDENTITY_UNKNOWN", "无法确认集群节点身份，拒绝自动导入")
+            identities[name] = cluster_identity(db.cluster_info())
             if name in pending:
                 for schema in schemas:
                     count = db.scalar("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=%s", (schema,))

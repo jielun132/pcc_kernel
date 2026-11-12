@@ -94,6 +94,32 @@ def test_proven_direction_and_reverse(snapshot, rule, a, b, sql, reverse):
     assert evaluate(item['assessment_evidence'], [])['status'] == 'review'
 
 
+@pytest.mark.parametrize('rule,mutation', [('A12','engine'), ('A02','engine'), ('A02','inner-role'),
+                                          ('A03','inner-role'), ('A17','engine'), ('A17','access'), ('A17','role')])
+@pytest.mark.parametrize('reverse', [False, True])
+def test_structural_rules_cannot_cover_unrelated_engine_object_or_role_changes(rule, mutation, reverse):
+    from pcc_tool.plan.parser import parse_plan
+    _, a, b, sql = next(c for c in directional_cases() if c[0] == rule)
+    query = QueryCase.create(sql, 'd')
+    plans = [parse_plan(PlanSnapshot(query.query_id, side, columns=['id','estRows','task','access object','operator info'], rows=rows(plan)))
+             for side, plan in [('old', a), ('new', b)]]
+    target = plans[1].roots[0]
+    if mutation == 'engine':
+        target.engine = 'tiflash'
+    elif mutation == 'access':
+        target.access = 'table:other'
+    elif mutation == 'role':
+        target.role = 'Build'
+    else:
+        target.children[0].role = 'Probe'
+    if reverse:
+        plans.reverse()
+    events, _ = api.compare_ir(*plans)
+    evidence = detect(query, *plans, events, 'changed', metadata=META)
+    assert evaluate(evidence)['status'] == 'review'
+    assert not any(m['rule_id'] == rule for m in evidence['matches'])
+
+
 def test_alias_cannot_hide_other_changes_or_computation(snapshot):
     a = node('Projection', reader(), info='d.t.id')
     b = node('Projection', reader(), info='d.t.id->Column#5')

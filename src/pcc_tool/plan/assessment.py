@@ -388,7 +388,8 @@ def detect(query, old, new, events, status, issues=(), metadata=None, captures=N
                 return "A11", "同排序和截断参数，有界 TopN 替代全量 Sort + Limit。", input_guard(sort.children[0].estimate, str(la[1] + la[2]))
         if (b.operator == "TableDual" and b.attributes == "rows:0" and number(b.estimate) == 0 and not b.children
                 and a.operator == "Selection" and a.attributes in {"0", "false", "eq(1, 0)", "eq(0, 1)"}
-                and number(a.estimate) == 0 and false_query(query) and a.task == b.task == "root"):
+                and number(a.estimate) == 0 and false_query(query) and a.task == b.task == "root"
+                and a.engine == b.engine == "tidb" and a.role == b.role and not a.access and not b.access):
             return "A17", "SQL 常量条件可证明结果为空；移除了仍被保留的扫描分支。", []
         if table_meta:
             result = access_patterns(a, b, tree, table_meta, known_stats and no_pseudo)
@@ -479,9 +480,10 @@ def access_patterns(a, b, tree, metadata, stats):
                 required = set(metadata["columns"])
             if (required <= available and table.operator == "TableRowIDScan" and not table.children
                     and table.access == "table:" + access[1] and table.attributes == "keep order:false"
-                    and table.task == index.task == "cop[tikv]"
+                    and table.task == index.task == "cop[tikv]" and table.engine == index.engine == "tikv"
+                    and index.role in {"", "Build"} and table.role in {"", "Probe"} and not new_index.role
                     and a.attributes == "" and attrs(b) == "child-reference" and a.role == b.role
-                    and not a.access and not b.access and a.task == b.task == "root"
+                    and not a.access and not b.access and a.task == b.task == "root" and a.engine == b.engine == "tidb"
                     and number(a.estimate) == number(b.estimate) == number(table.estimate) == number(index.estimate)):
                 return "A02", "同一索引范围与候选量，DDL 和 SQL 所需列证明覆盖，无回表过滤；消除回表。", []
     if a.operator == b.operator == "IndexLookUp" and shell(a, b) and len(a.children) == len(b.children) == 2 and stats:
@@ -489,6 +491,8 @@ def access_patterns(a, b, tree, metadata, stats):
         bi, bt = b.children
         if (at.operator == bi.operator == "Selection" and len(at.children) == len(bi.children) == 1
                 and at.task == bi.task == ai.task == bt.task == "cop[tikv]"
+                and ai.role in {"", "Build"} and bi.role in {"", "Build"}
+                and at.role in {"", "Probe"} and bt.role in {"", "Probe"}
                 and shell(at, bi, estimate=True, role=True) and same(ai, bi.children[0], ignore_role=True)
                 and same(at.children[0], bt, ignore_estimate=True, ignore_role=True)
                 and bt.operator == "TableRowIDScan" and ai.operator in {"IndexRangeScan", "IndexFullScan"}
@@ -520,7 +524,7 @@ def aggregate_pattern(a, b):
             or partial.access or partial.role or a.access or b.access
             or number(br.estimate) != number(partial.estimate)
             or not shell(ar, br, estimate=True) or not same(ar.children[0], partial.children[0])
-            or number(a.estimate) != number(b.estimate) or a.task != b.task or a.role != b.role):
+            or number(a.estimate) != number(b.estimate) or a.task != b.task or a.engine != b.engine or a.role != b.role):
         return None
     guards = input_guard(ar.estimate, br.estimate, minimum=10000)
     guards.append(dict(kind="ratio", input=ar.estimate, output=br.estimate, constant="10", label="A12 最大中间行比例 (%)"))
