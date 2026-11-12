@@ -59,6 +59,9 @@ def parser():
     compare.add_argument("--new", required=True)
     compare.add_argument("--out", required=True)
     compare.add_argument("--resume", action="store_true")
+    compare.add_argument("--warmup-only", action="store_true", help="仅执行一轮普通 EXPLAIN 预热，不生成比较报告")
+    compare.add_argument("--rules-config", help="外部规则 JSON 配置")
+    compare.add_argument("--rule-profile", help="版本规则方案 ID；auto 按实际版本匹配")
     compare.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="每个目标从首批开始的采集并发，1 至 16")
     compare.add_argument("--timeout-seconds", type=int, default=30)
     compare.add_argument("--stats-retries", type=int, default=1)
@@ -68,6 +71,8 @@ def parser():
     diff.add_argument("--result-dir", required=True)
     diff.add_argument("--out", required=True)
     diff.add_argument("--resume", action="store_true")
+    diff.add_argument("--rules-config", help="外部规则 JSON；省略时继承归档配置")
+    diff.add_argument("--rule-profile", help="版本规则方案 ID")
     return p
 
 

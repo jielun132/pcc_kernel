@@ -5,7 +5,7 @@ from difflib import SequenceMatcher
 
 from pcc_tool import __version__
 from pcc_tool.artifacts.store import atomic_writer
-from pcc_tool.models import canonical, primitive
+from pcc_tool.models import business_value, canonical, digest, primitive
 from pcc_tool.render.findings import comparison_method, findings_panel, grouping_panel, unavailable_reason
 from pcc_tool.render.navigation import NAV_STYLES, SCRIPT, navigation_chunks, plan_copy_text, plan_group
 from pcc_tool.render.assessment import ASSESSMENT_SCRIPT, ASSESSMENT_STYLES, assessment_markup
@@ -531,6 +531,8 @@ def _report_records(result, queries, snapshots, irs, writer):
                      f'<details><summary>排名、来源、覆盖与问题</summary><pre>{escaped({"metrics": q.metrics, "origins": q.sample_origins, "item": item})}</pre></details></details></article>')
         group_key, group_title = plan_group(irs, q.query_id, status)
         yield dict(id=anchor, queryId=q.query_id, number=index, schema=q.schema, status=status, category=category,
+                            reviewBasis=digest(business_value({"query": q, "comparison": item, "diffs": events,
+                                "plans": [snapshots.get((q.query_id, side)) for side in ("old", "new")]})),
                             attention=needs_attention, needsSample=bool(item.get("needs_sample")),
                             assessment=item.get("assessment"), assessmentEvidence=item.get("assessment_evidence", dict(
                                 scope=status, event_refs=[str(i) for i in range(1, len(events) + 1)], matches=[], hints=[], blockers=["没有规则证据"])),
@@ -572,7 +574,7 @@ def render_reports(root, result, queries, snapshots, irs, selection, context):
         report += f'<p class="issue-note">{escaped(context["validation_note"])}</p>'
     report += report_overview(selection, context, result, queries, snapshots) + comparison_method()
     report += grouping_panel(result.items, queries) + '</div></details></div></header>'
-    report += assessment_markup(result.fingerprint)
+    report += assessment_markup(result.fingerprint, result.assessment_policy)
     with atomic_writer(root / "differences.csv", "w", encoding="utf-8-sig", newline="") as csv_file, \
             atomic_writer(root / "report.html", "w", encoding="utf-8", newline="") as html_file:
         writer = csv.writer(csv_file)

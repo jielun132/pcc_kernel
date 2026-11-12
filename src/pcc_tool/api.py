@@ -251,7 +251,7 @@ def prepare(request: PrepareRequest, *, profiles=None, on_event=None) -> dict:
             "run_status": "partial" if bundle.issues else "completed"}
 
 
-def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, assessment_schema=None):
+def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, assessment_schema=None, policy=None):
     from pcc_tool.plan.findings import classify_findings
     from pcc_tool.plan.assessment import detect, evaluate
     items, diffs, irs = [], [], {}
@@ -310,7 +310,8 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, asses
         item["assessment_evidence"] = detect(q, irs.get((q.query_id, "old")), irs.get((q.query_id, "new")),
             events, item["compare_status"], item["issues"], assessment_schema,
             {side: snapshots.get((q.query_id, side)) for side in ("old", "new")})
-        item["assessment"] = evaluate(item["assessment_evidence"])
+        item["assessment"] = evaluate(item["assessment_evidence"],
+                                      (policy or {}).get("selected"), (policy or {}).get("thresholds"))
         if item["assessment_evidence"]["mandatory_reviews"]:
             item["requires_review"] = True
         items.append(item)
@@ -351,21 +352,21 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, asses
     for item in items:
         all_issues.extend(item["issues"])
     unique_issues = {digest(i): i for i in all_issues}
-    return ComparisonResult(fingerprint, primitive(summary), items, diffs, list(unique_issues.values()), status), irs
+    return ComparisonResult(fingerprint, primitive(summary), items, diffs, list(unique_issues.values()), status,
+                            assessment_policy=policy or {}), irs
 
 
 def _write_result(root, result, bundle, snapshots, irs, events, assessment_schema=None):
     from pcc_tool.plan.findings import similar_groups
-    from pcc_tool.plan.rule_catalog import ASSESSMENT_VERSION, RULE_CATALOG, DEFAULT_RULES, DEFAULT_THRESHOLDS
+    from pcc_tool.plan.rule_config import load_policy
     write_json(root / "summary.json", result.summary)
     write_jsonl(root / "items.jsonl", result.items)
     write_jsonl(root / "diffs.jsonl", result.diffs)
     write_jsonl(root / "issues.jsonl", result.issues)
     write_jsonl(root / "findings.jsonl", [f for item in result.items for f in item.get("findings", [])])
     write_json(root / "similar_groups.json", similar_groups(result.items))
-    write_json(root / "assessment_rules.json", {"version": ASSESSMENT_VERSION, "rules": RULE_CATALOG,
-        "selected": DEFAULT_RULES, "thresholds": DEFAULT_THRESHOLDS, "report_fingerprint": result.fingerprint,
-        "rules_fingerprint": digest(RULE_CATALOG)})
+    write_json(root / "assessment_rules.json", {**(result.assessment_policy or load_policy()),
+                                              "report_fingerprint": result.fingerprint})
     write_jsonl(root / "assessments.jsonl", [{"query_id": i["query_id"], "evidence": i["assessment_evidence"],
                                              "result": i["assessment"]} for i in result.items])
     write_jsonl(root / "inputs/queries.jsonl", bundle.queries)
@@ -532,6 +533,12 @@ def compare(request: CompareRequest, *, profiles=None, on_event=None, cancel=Non
         raise PCCError("INVALID_CONFIG", "并发、超时或重试次数超出范围")
     if request.old == request.new:
         raise PCCError("INVALID_CONFIG", "old 和 new 必须是两套独立目标")
+    if type(request.warmup_only) is not bool:
+        raise PCCError("INVALID_CONFIG", "warmup_only 必须是布尔值")
+    if request.warmup_only:
+        request = dataclasses.replace(request, stats_retries=0)
+    from pcc_tool.plan.rule_config import load_policy
+    policy = load_policy(request.rules_config, request.rule_profile)
     bundle = load_bundle(request.bundle)
     from pcc_tool.plan.assessment import schema_evidence
     assessment_schema = schema_evidence(bundle)
@@ -564,19 +571,27 @@ def compare(request: CompareRequest, *, profiles=None, on_event=None, cancel=Non
     common = [fmt for fmt in ("tidb_json", "row") if all(fmt in supported[s] for s in supported)]
     if not common:
         raise PCCError("PLAN_FORMAT_UNSUPPORTED", "两端没有共同支持的计划格式")
+    policy = load_policy(profile_id=request.rule_profile, archived=policy["policy_config"],
+                         versions={s: info["version"] for s, info in target_info.items()})
     inputs = business_value({"bundle": _bundle_business(bundle), "targets": target_info,
         "session": request.session, "profile_sessions": {s: p.get("session", {}) for s, p in target_profiles.items()},
         "binding_policy": request.binding_policy, "versions": VERSIONS, "format": common[0],
         "timeout_seconds": request.timeout_seconds, "stats_retries": request.stats_retries})
+    if request.warmup_only:
+        inputs["phase"] = "warmup"
+    elif request.rules_config or request.rule_profile:
+        inputs["assessment_policy"] = policy
     fingerprint = digest(inputs)
-    # v5 and v6 change assessment only. v3 did not archive the projection session variable.
+    # Assessment-only changes can reuse validated raw plans. v3 did not archive
+    # the projection session variable. Configured policies have distinct inputs.
     compatible = ()
-    if request.resume and VERSIONS["assessment_version"] == "6":
+    if request.resume and not request.warmup_only and VERSIONS["assessment_version"] == "7":
         legacy_targets = {s: {**info, "session": {k: v for k, v in info["session"].items()
                                                   if k != "tidb_opt_projection_push_down"}}
                           for s, info in inputs["targets"].items()}
         compatible = tuple(digest({**inputs, "targets": targets, "versions": {**inputs["versions"], "assessment_version": version}})
-                           for version, targets in (("5", inputs["targets"]), ("4", inputs["targets"]), ("3", legacy_targets)))
+                           for version, targets in (("6", inputs["targets"]), ("5", inputs["targets"]),
+                                                    ("4", inputs["targets"]), ("3", legacy_targets)))
     events.emit("compare_started", fingerprint=fingerprint, format=common[0], targets=target_info)
     with Publication(request.out, fingerprint, request.resume, compatible_fingerprints=compatible) as publication:
         root = publication.work
@@ -591,7 +606,9 @@ def compare(request: CompareRequest, *, profiles=None, on_event=None, cancel=Non
                     snapshot = PlanSnapshot(**raw)
                     if snapshot.query_id not in query_ids or snapshot.side != side:
                         raise PCCError("ARTIFACT_INVALID", "恢复计划不属于本次输入")
-                    if (snapshot.capture_status == "ok" and (snapshot.query_id, side) not in snapshots
+                    from pcc_tool.capture.explain import has_unloaded_stats
+                    if (snapshot.capture_status == "ok" and (snapshot.issues or not has_unloaded_stats(snapshot))
+                            and (snapshot.query_id, side) not in snapshots
                             and (snapshot.query_id, side) not in snapshots.deferred):
                         snapshots.save(snapshot)
         _capture_plans(bundle.queries, snapshots, target_profiles, common[0], request, cancel, events,
@@ -620,8 +637,30 @@ def compare(request: CompareRequest, *, profiles=None, on_event=None, cancel=Non
 
         for side, issues in _check_both(target_profiles, events, "postcheck", postcheck).items():
             pre_issues.extend({**i, "side": side} for i in issues)
+        if request.warmup_only:
+            # Retain observations and resume checkpoints, without comparing,
+            # assessing or rendering the first EXPLAIN as an upgrade result.
+            summary = {"selected_samples": str(len(bundle.queries)), "phase": "warmup",
+                       "observations": str(len(snapshots)), "full_comparisons": "0"}
+            issues = [*pre_issues, *(i for snapshot in snapshots.values() for i in snapshot.issues)]
+            result = ComparisonResult(fingerprint, summary, [], [], issues,
+                                      "interrupted" if cancel.is_set() else "completed")
+            result.output_dir = str(publication.work if cancel.is_set() else publication.output)
+            for side in ("old", "new"):
+                write_jsonl(root / f"plans/{side}.jsonl", (snapshots[q.query_id, side] for q in bundle.queries
+                                                         if (q.query_id, side) in snapshots))
+            write_json(root / "summary.json", summary)
+            write_jsonl(root / "issues.jsonl", issues)
+            events.emit("warmup_completed", run_status=result.run_status, summary=summary)
+            write_jsonl(root / "events.jsonl", events.rows)
+            publication.checkpoint(run_status=result.run_status, completed=[list(k) for k in sorted(snapshots)])
+            manifest = {"kind": "PlanWarmup", "versions": VERSIONS, "run_status": result.run_status,
+                        "targets": target_info, "created_at": now()}
+            if not cancel.is_set():
+                publication.publish(manifest)
+            return result
         events.emit("compare_stage", stage="diff")
-        result, irs = _summarize(bundle.queries, snapshots, fingerprint, pre_issues, cancel.is_set(), assessment_schema)
+        result, irs = _summarize(bundle.queries, snapshots, fingerprint, pre_issues, cancel.is_set(), assessment_schema, policy)
         result.output_dir = str(publication.work if cancel.is_set() else publication.output)
         events.emit("compare_stage", stage="write_report")
         events.emit("compare_completed", run_status=result.run_status, summary=result.summary, exit_code=result.exit_code)
@@ -661,14 +700,32 @@ def diff(request: DiffRequest, *, on_event=None, cancel=None) -> ComparisonResul
             assessment_schema[obj["schema"] + "." + obj["table"]] = dict(
                 view_dependencies=obj.get("dependencies", []),
                 view_reviews=[["D10", "归档缺少视图定义，无法排除内部读表求值。"]])
+    from pcc_tool.plan.rule_config import load_policy
+    rule_path = root / "assessment_rules.json"
+    archived_rules = read_json(rule_path) if rule_path.exists() else {}
+    actual_versions = {}
+    for side in ("old", "new"):
+        versions = {p.version for (qid, s), p in snapshots.items() if s == side and p.version not in {"", "unknown"}}
+        actual_versions[side] = next(iter(versions)) if len(versions) == 1 else "unknown"
+    policy = load_policy(request.rules_config,
+                         request.rule_profile or (archived_rules.get("profile_id") if not request.rules_config else None),
+                         actual_versions, archived_rules.get("policy_config"))
     fingerprint = digest(business_value({"inputs": _bundle_business(bundle), "snapshots": [snapshots[k] for k in sorted(snapshots)],
-                                         "versions": VERSIONS, "assessment_schema": assessment_schema}))
+                                         "versions": VERSIONS, "assessment_schema": assessment_schema, "assessment_policy": policy}))
     events = Events(on_event)
     events.emit("diff_started", fingerprint=fingerprint)
     # Keep capture/preflight failures, but recalculate parser/matcher findings with current algorithms.
     issues = [i for i in read_jsonl(root / "issues.jsonl") if i.get("code") not in
               {"PLAN_PARSE_FAILED", "PLAN_SEMANTICS_UNKNOWN", "PLAN_MATCH_AMBIGUOUS", "CONTEXT_DIFFERENCE"}]
-    result, irs = _summarize(queries, snapshots, fingerprint, issues, bool(cancel and cancel.is_set()), assessment_schema)
+    # Old archives may have accepted partial statistics without a capture issue.
+    # Recheck at the archive boundary, preserving the original observation.
+    from pcc_tool.capture.explain import has_unloaded_stats
+    issues.extend({"code": "STATS_NOT_READY", "side": side, "query_id": qid,
+                   "message": "归档计划包含 pseudo / partial 统计，需重新采集确认统计完整"}
+                  for (qid, side), snapshot in snapshots.items()
+                  if snapshot.capture_status == "ok" and not any(i.get("code") == "STATS_NOT_READY" for i in snapshot.issues)
+                  and has_unloaded_stats(snapshot))
+    result, irs = _summarize(queries, snapshots, fingerprint, issues, bool(cancel and cancel.is_set()), assessment_schema, policy)
     with Publication(request.out, fingerprint, request.resume) as publication:
         result.output_dir = str(publication.output)
         events.emit("diff_completed", run_status=result.run_status, summary=result.summary, exit_code=result.exit_code)

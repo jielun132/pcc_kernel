@@ -155,9 +155,12 @@ def test_status_identity_handles_compatibility_prefix(monkeypatch, status_versio
     from pcc_tool.capture import connection
     class DB:
         def cluster_info(self):
-            return [{"TYPE": "tidb", "STATUS_ADDRESS": "source:10080", "VERSION": "v6.5.12", "GIT_HASH": "commit"}]
+            return [{"TYPE": "tidb", "STATUS_ADDRESS": "source:10080", "VERSION": "v6.5.12", "GIT_HASH": "commit"},
+                    {"TYPE": "pd", "INSTANCE": "source-pd:2379"}]
     monkeypatch.setattr(connection, "status_json", lambda *a: {"version": status_version, "git_hash": "commit"})
-    assert connection.verify_status_identity(DB(), {"status_url": "http://source:10080"})["verified"]
+    identity = connection.verify_status_identity(DB(), {"status_url": "http://source:10080"})
+    assert identity["verified"]
+    assert identity["cluster_nodes"] == DB().cluster_info() and identity["node"] in identity["cluster_nodes"]
     monkeypatch.setattr(connection, "status_json", lambda *a: {"version": status_version, "git_hash": "other"})
     with pytest.raises(PCCError):
         connection.verify_status_identity(DB(), {"status_url": "http://source:10080"})

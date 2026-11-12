@@ -105,6 +105,35 @@ def test_pseudo_is_incomplete_with_attempt_evidence():
         FakeDB.pseudo = False
 
 
+@pytest.mark.parametrize("status", ["partial[id:unInitialized]", "partial[id:allEvicted]", "partial[a:missing]", "pseudo"])
+def test_incomplete_stats_are_retried_without_discarding_observations(status):
+    class LoadingDB(FakeDB):
+        count = 0
+        def query(self, sql, params=()):
+            columns, rows = super().query(sql, params)
+            if sql.startswith('EXPLAIN'):
+                self.count += 1
+                rows[0][-1] = 'stats:' + status if self.count == 1 else 'rows:1'
+            return columns, rows
+    class NoDelay(threading.Event):
+        def wait(self, timeout=None):
+            return self.is_set()
+    result = capture_plan(QueryCase.create('SELECT 1'), 'new', {'host':'fake'}, stats_retries=1,
+                          db_factory=LoadingDB, cancel=NoDelay())
+    assert len(result.attempts) == 2 and not result.issues
+    assert status in str(result.attempts[0]['rows']) and 'rows:1' in str(result.rows)
+
+
+def test_stats_words_in_sql_literals_are_not_loading_diagnostics():
+    from pcc_tool.capture.explain import has_unloaded_stats
+    from pcc_tool.models import PlanSnapshot
+    for text in ('"stats:partial[id:unInitialized]"->Column#1', 'eq(t.note, "stats:pseudo")',
+                 'range:["stats:partial[id:unInitialized]","stats:partial[id:unInitialized]"], keep order:false'):
+        snapshot = PlanSnapshot('q','new',columns=['id','estRows','task','access object','operator info'],
+                                rows=[['Projection_1','1','root','',text]])
+        assert not has_unloaded_stats(snapshot)
+
+
 def test_pre_cancel_does_not_connect():
     cancel = threading.Event()
     cancel.set()

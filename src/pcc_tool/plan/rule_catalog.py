@@ -1,6 +1,6 @@
 """Versioned, offline rule cards. A card is not evidence that its premise holds."""
 
-ASSESSMENT_VERSION = "6"
+ASSESSMENT_VERSION = "7"
 DEFAULT_THRESHOLDS = {"min_rows": "1000", "max_ratio_pct": "10", "reduction_pct": "50", "estimate_pct": "10"}
 REQUIRED_DATA_RULES = {"D01", "D02", "D08", "D10"}
 

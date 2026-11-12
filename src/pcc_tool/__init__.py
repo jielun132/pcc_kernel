@@ -1,3 +1,3 @@
 """PCC Core. Importing this package performs no I/O."""
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"

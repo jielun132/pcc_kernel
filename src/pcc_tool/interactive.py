@@ -28,7 +28,8 @@ from pcc_tool.workflow import import_target, inspect_targets, mysql_command, val
 DEFAULTS = {"source": "prod", "old": "old", "new": "new", "out_dir": "pcc-output", "top_n": 20,
             "order_by": list(METRICS), "ranking_scope": "global", "schemas": [],
             "statement_types": ["select", "update", "delete"], "stats_retries": 5, "concurrency": DEFAULT_CONCURRENCY,
-            "timeout_seconds": 60, "mysql_client": "mysql", "sql_file": "", "begin": "", "end": ""}
+            "timeout_seconds": 60, "mysql_client": "mysql", "sql_file": "", "begin": "", "end": "",
+            "rules_config": "", "rule_profile": ""}
 
 
 def settings(path):
@@ -40,7 +41,7 @@ def settings(path):
     for key in ("source", "old", "new"):
         if not isinstance(cfg[key], str) or not cfg[key].isidentifier():
             raise PCCError("INVALID_CONFIG", "workflow 环境名必须是标识符")
-    for key in ("out_dir", "mysql_client", "sql_file", "begin", "end"):
+    for key in ("out_dir", "mysql_client", "sql_file", "begin", "end", "rules_config", "rule_profile"):
         if not isinstance(cfg[key], str) or (key in {"out_dir", "mysql_client"} and not cfg[key]):
             raise PCCError("INVALID_CONFIG", "workflow 路径或时间字段无效")
     for key, low, high in (("top_n", 1, 10000), ("stats_retries", 0, 5), ("concurrency", 1, 16), ("timeout_seconds", 1, 300)):
@@ -53,7 +54,7 @@ def settings(path):
             or set(cfg["statement_types"]) - {"select", "update", "delete", "insert", "replace"}
             or cfg["ranking_scope"] not in {"global", "per_schema"}):
         raise PCCError("INVALID_CONFIG", "workflow 筛选参数无效")
-    for key in ("out_dir", "sql_file"):
+    for key in ("out_dir", "sql_file", "rules_config"):
         if cfg[key]:
             cfg[key] = str((path.parent / cfg[key]).resolve())
     if "/" in cfg["mysql_client"]:
@@ -105,6 +106,8 @@ class Menu:
         self.index_path = self.root / "ui-state.json"
         self.state = read_json(self.index_path) if self.index_path.exists() else {}
         self.secrets = {}
+        self.original_secrets = {}
+        self.last_password = None
         self.cancel = threading.Event()
 
     def save(self):
@@ -118,23 +121,70 @@ class Menu:
             profile = profile_named(self.profiles, name)
             for key, label in credentials:
                 reference = profile.get(key)
-                if reference and reference not in os.environ:
-                    # getpass may fall back to echoed input; refuse that fallback.
-                    import warnings
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("error", getpass.GetPassWarning)
+                if not reference:
+                    continue
+                rejected = False
+                while True:
+                    if reference in os.environ:
+                        value = os.environ[reference]
+                    else:
+                        previous = self.last_password if key == "password_env" and not rejected else None
+                        hint = "回车复用本次已输入的密码" if previous is not None else "首次输入，不能为空"
+                        value = self.read_secret(f"{name} {label}（输入不回显；{hint}）: ")
+                        if not value:
+                            if previous is None:
+                                print(f"尚无可复用的{label}，请隐藏输入；配置中的凭据字段是环境变量名，不是密码。")
+                                continue
+                            value = previous
+                        self.set_secret(reference, value)
+                    if key == "password_env" and not sql_only:
                         try:
-                            value = getpass.getpass(f"{name} {label}（{reference}，本次会话复用）: ")
-                        except getpass.GetPassWarning:
-                            raise PCCError("SECURE_INPUT_UNAVAILABLE", "当前终端不支持隐藏输入，请先设置密码环境变量") from None
-                    os.environ[reference] = value
-                    self.secrets[reference] = value
+                            with Database(profile):
+                                pass
+                        except DBConnectError as exc:
+                            if exc.driver_code != 1045:
+                                raise
+                            self.set_secret(reference, None)
+                            if self.last_password == value:
+                                self.last_password = None
+                            rejected = True
+                            print(f"{name} 账号或密码被拒绝（1045），请重新输入密码；Ctrl+C 退出。")
+                            continue
+                    if key == "password_env":
+                        self.last_password = value
+                    break
+
+    @staticmethod
+    def read_secret(prompt):
+        # getpass may fall back to echoed input; refuse that fallback.
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            try:
+                return getpass.getpass(prompt)
+            except getpass.GetPassWarning:
+                raise PCCError("SECURE_INPUT_UNAVAILABLE", "当前终端不支持隐藏输入，请先设置密码环境变量") from None
+
+    def set_secret(self, reference, value):
+        if reference not in self.original_secrets:
+            self.original_secrets[reference] = os.environ.get(reference)
+        if value is None:
+            os.environ.pop(reference, None)
+        else:
+            os.environ[reference] = value
+        self.secrets[reference] = value
 
     def close(self):
         for reference, value in self.secrets.items():
             if os.environ.get(reference) == value:
-                os.environ.pop(reference, None)
+                original = self.original_secrets[reference]
+                if original is None:
+                    os.environ.pop(reference, None)
+                else:
+                    os.environ[reference] = original
         self.secrets.clear()
+        self.original_secrets.clear()
+        self.last_password = None
 
     def new_dir(self, name):
         return self.root / (name + "-" + datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3))
@@ -217,7 +267,12 @@ class Menu:
             end = time_value(ask("结束时间", cfg["end"]), timezone)
             if datetime.fromisoformat(begin) >= datetime.fromisoformat(end):
                 raise PCCError("INVALID_TIME", "结束时间必须晚于开始时间")
-            schemas = tuple(x.strip() for x in ask("库名（逗号分隔；留空为全部）", ",".join(cfg["schemas"])).split(",") if x.strip())
+            default_schemas = ",".join(cfg["schemas"])
+            label = "库名（逗号分隔；回车用默认，输入 * 采集全部库）" if default_schemas else "库名（逗号分隔；回车或 * 采集全部库）"
+            selected = ask(label, default_schemas)
+            schemas = () if selected == "*" else tuple(x.strip() for x in selected.split(",") if x.strip())
+            if "*" in schemas:
+                raise PCCError("INVALID_CONFIG", "采集全部库请单独输入 *，不要与库名混填")
             options.update(from_summary=True, begin=begin, end=end, schemas=schemas, top_n=cfg["top_n"],
                            order_by=tuple(cfg["order_by"]), ranking_scope=cfg["ranking_scope"])
         else:
@@ -261,6 +316,9 @@ class Menu:
         if not self.state.get("task"):
             print("尚无任务，请先选择 2 或 3。")
             return
+        from pcc_tool.plan.rule_config import load_policy
+        load_policy(self.cfg["rules_config"] or None,
+                    self.state.get("rule_profile") or self.cfg["rule_profile"] or None)
         task = Path(self.state["task"])
         state = read_json(task / "task.json")
         if state["profiles_hash"] != digest(self.profiles):
@@ -301,8 +359,10 @@ class Menu:
                 schemas = validate_materials(bundle)
                 for name in pending:
                     mysql_command(profile_named(self.profiles, name), self.cfg["mysql_client"])
-                self.password((source, old, new))
-                versions = inspect_targets(self.profiles, source, old, new, schemas, pending)
+                fixed = bool(state.get("fixed_bundle_hash"))
+                source_identity = (bundle.context.get("status_identity") or {}) if fixed else None
+                self.password((old, new) if fixed else (source, old, new))
+                versions = inspect_targets(self.profiles, source, old, new, schemas, pending, source_identity)
                 for name in pending:
                     p = self.profiles[name]
                     print(f"导入 {name}: {p['host']}:{p.get('port', 4000)}，实际版本 {versions[name]}")
@@ -311,7 +371,7 @@ class Menu:
                 if ask("输入 IMPORT 确认，其他输入返回") != "IMPORT":
                     return
                 # Recheck after user input, since the confirmation can remain open indefinitely.
-                inspect_targets(self.profiles, source, old, new, schemas, pending)
+                inspect_targets(self.profiles, source, old, new, schemas, pending, source_identity)
                 for name in pending:
                     state["importing"] = name
                     write_json(task / "task.json", state)
@@ -330,20 +390,24 @@ class Menu:
             self.capture_label = "预热" if report.name == "warmup" else "正式采集"
             print(paint(f"{self.capture_label} · 从首批开始 old/new 每端最多 {count} 份并发，跨表调度", "1;34"))
             return self.core(api.compare, CompareRequest(str(bundle_path), old, new, str(report), resume=partial.exists(),
-                             stats_retries=self.cfg["stats_retries"], concurrency=count,
+                             stats_retries=0 if report.name == "warmup" else self.cfg["stats_retries"], concurrency=count,
+                             warmup_only=report.name == "warmup",
+                             rules_config=self.cfg["rules_config"] or None,
+                             rule_profile=self.state.get("rule_profile") or self.cfg["rule_profile"] or None,
                              timeout_seconds=self.cfg["timeout_seconds"]), profiles=self.profiles)
 
-        if state.get("fixed_bundle_hash"):
-            warmup = task / "warmup"
-            if not warmup.exists():
-                print(paint("固定材料首次复测，先在两端采集一轮普通 EXPLAIN 预热。", "1;34"))
-                observation = collect(warmup)
-                if observation.run_status == "interrupted":
-                    print("已保存预热进度，选择 4 继续。")
-                    return
-                print(f"预热观测已保存到 {warmup}。开始正式采集。")
-            else:
-                verify(warmup, "ComparisonResult")
+        warmup = task / "warmup"
+        if not warmup.exists():
+            print(paint("先在两端执行一轮普通 EXPLAIN 加载统计信息；预热不参与计划比较。", "1;34"))
+            observation = collect(warmup)
+            if observation.run_status == "interrupted":
+                print("已保存预热进度，选择 4 继续。")
+                return
+            print(f"预热观测已保存到 {warmup}。开始正式采集。")
+        else:
+            # 0.1.6 stored its fixed-material warmup as a ComparisonResult.
+            if verify(warmup).get("kind") not in {"PlanWarmup", "ComparisonResult"}:
+                raise PCCError("ARTIFACT_INVALID", "预热材料类型不正确")
         if state.get("report_pending"):
             report = Path(state["report_pending"])
         else:
@@ -389,26 +453,44 @@ class Menu:
             else:
                 print(paint(f"{name}  登录成功", "32"), flush=True)
         for ref in rejected & self.secrets.keys():
-            if os.environ.get(ref) == self.secrets.pop(ref):
-                os.environ.pop(ref, None)
+            if os.environ.get(ref) == self.secrets[ref]:
+                if self.last_password == self.secrets[ref]:
+                    self.last_password = None
+                self.set_secret(ref, None)
 
     def offline(self):
         if not self.state.get("report"):
             print("尚无报告。")
             return
         out = self.new_dir("offline")
-        result = self.core(api.diff, DiffRequest(self.state["report"], str(out)))
+        result = self.core(api.diff, DiffRequest(self.state["report"], str(out),
+                           rules_config=self.cfg["rules_config"] or None,
+                           rule_profile=self.state.get("rule_profile") or self.cfg["rule_profile"] or None))
         print_result(result)
         print(f"离线报告：{out / 'report.html'}")
 
+    def rule_profile(self):
+        from pcc_tool.plan.rule_config import load_policy
+        policy = load_policy(self.cfg["rules_config"] or None)
+        print("0  按实际采集版本自动匹配")
+        for i, profile in enumerate(policy["profiles"], 1):
+            print(f"{i}  {profile['label']}  [{profile['id']}]")
+        choice = ask("选择版本规则方案", "0")
+        if not choice.isdigit() or not 0 <= int(choice) <= len(policy["profiles"]):
+            raise PCCError("INVALID_CHOICE", "请选择显示的方案编号")
+        self.state["rule_profile"] = "auto" if choice == "0" else policy["profiles"][int(choice) - 1]["id"]
+        self.save()
+        print("已选择规则方案；下次比较或离线重算生效。实际连接版本仍按 profiles 精确校验。")
+
     def loop(self):
         actions = {"1": self.demo, "2": lambda: self.start(True), "3": lambda: self.start(False),
-                   "4": self.continue_task, "5": self.reports, "6": self.doctor, "7": self.offline}
+                   "4": self.continue_task, "5": self.reports, "6": self.doctor, "7": self.offline, "8": self.rule_profile}
         while True:
             print("\n" + paint(f"PCC {__version__}  操作菜单", "1;36") + f"   old/new 各 {self.cfg['concurrency']} 份并发")
             for title, entries in (
                 ("采集与比较", (("1", "生成演示 SQL 案例"), ("2", "按时间采集 Top SQL 并比较"), ("3", "从 SQL 文件全量比较"))),
                 ("任务与工具", (("4", "继续上次任务"), ("5", "查看报告位置"), ("6", "检查数据库登录"), ("7", "离线重算上次报告"))),
+                ("评审配置", (("8", "选择版本规则方案"),)),
             ):
                 print(paint("  " + title, "1;34"))
                 for key, label in entries:

@@ -51,7 +51,7 @@
         "tidb_enforce_mpp": "OFF",
         "tidb_stats_load_sync_wait": 10000
       },
-      "expected_version": "v8.5.5"
+      "expected_version": "v8.5.7"
     }
   },
   "workflow": {
@@ -80,6 +80,8 @@
     "sql_file": "",
     "concurrency": 8,
     "timeout_seconds": 60,
-    "stats_retries": 5
+    "stats_retries": 5,
+    "rules_config": "",
+    "rule_profile": ""
   }
 }

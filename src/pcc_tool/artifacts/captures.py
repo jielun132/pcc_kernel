@@ -2,6 +2,7 @@
 from collections.abc import Mapping
 
 from pcc_tool.artifacts.store import read_json, safe_path, write_bytes
+from pcc_tool.capture.explain import has_unloaded_stats
 from pcc_tool.models import PCCError, PlanSnapshot, byte_hash, canonical, digest
 
 
@@ -63,7 +64,7 @@ class SavedPlans(Mapping):
     def restore(self, query_ids, max_retries):
         for path in sorted(self.directory.glob("*.json")):
             snapshot = _read_checkpoint(path, query_ids)
-            if snapshot.capture_status == "ok":
+            if snapshot.capture_status == "ok" and (snapshot.issues or not has_unloaded_stats(snapshot)):
                 self.paths[snapshot.query_id, snapshot.side] = path
         pending = {}
         for path in self.retry_directory.glob("*.json"):

@@ -50,6 +50,89 @@ def test_online_to_offline_equal(tmp_path, online):
     assert offline.summary == result.summary and offline.diffs == result.diffs
 
 
+def test_warmup_only_archives_first_observation_and_formal_recaptures(tmp_path, online, monkeypatch):
+    bundle, profiles, calls, capture = online
+    attempts = {}
+    def cold_capture(q, side, profile, **kwargs):
+        key = q.query_id, side
+        attempts[key] = attempts.get(key, 0) + 1
+        value = capture(q, side, profile, **kwargs)
+        if attempts[key] == 1:
+            value.capture_status = "failed"
+            value.issues = [{"code": "STATS_NOT_READY"}]
+        return value
+    monkeypatch.setattr(api, "capture_plan", cold_capture)
+    warmup = tmp_path / "warmup"
+    with monkeypatch.context() as guard:
+        guard.setattr(api, "_summarize", lambda *a, **k: pytest.fail("Warmup compared plans"))
+        guard.setattr(api, "render_reports", lambda *a, **k: pytest.fail("Warmup generated a report"))
+        result = api.compare(CompareRequest(bundle.path, "old", "new", str(warmup), warmup_only=True, stats_retries=5), profiles=profiles)
+    assert verify(warmup, "PlanWarmup")["run_status"] == "completed"
+    assert result.summary["full_comparisons"] == "0" and not result.items and not result.diffs
+    assert not (warmup / "report.html").exists() and set(attempts.values()) == {1}
+    formal = api.compare(CompareRequest(bundle.path, "old", "new", str(tmp_path / "formal")), profiles=profiles)
+    assert formal.summary["same"] == "4" and formal.exit_code == 0 and set(attempts.values()) == {2}
+    with pytest.raises(PCCError):
+        api.diff(DiffRequest(str(warmup), str(tmp_path / "not-a-report")))
+
+
+def test_warmup_resumes_without_reusing_first_observation_as_formal(tmp_path, online):
+    from dataclasses import replace
+    bundle, profiles, calls, _ = online
+    stop = threading.Event()
+    request = CompareRequest(bundle.path, "old", "new", str(tmp_path / "warmup"), warmup_only=True, concurrency=1)
+    def event(value):
+        if value["event"] == "plan_captured":
+            stop.set()
+    first = api.compare(request, profiles=profiles, on_event=event, cancel=stop)
+    assert first.run_status == "interrupted" and not (tmp_path / "warmup").exists()
+    second = api.compare(replace(request, resume=True), profiles=profiles)
+    assert second.run_status == "completed" and len(calls) == len(set(calls)) == 8
+    assert not (tmp_path / "warmup/report.html").exists()
+
+
+def test_external_rule_policy_is_archived_and_inherited_offline(tmp_path, online):
+    bundle, profiles, _, _ = online
+    path=tmp_path/'policy.json'
+    raw={'schema_version':1,'selected':['E01'],'thresholds':{'min_rows':2345},
+         'cards':{'E01':{'review_note':'核对列来源'}},
+         'profiles':[{'id':'custom','label':'Custom 6.5.12 → 8.5.4','old_version':'6.5.12','new_version':'8.5.4'}]}
+    path.write_text(json.dumps(raw))
+    result=api.compare(CompareRequest(bundle.path,'old','new',str(tmp_path/'configured'),rules_config=str(path)),profiles=profiles)
+    assert result.assessment_policy['profile_id']=='custom'
+    assert result.assessment_policy['thresholds']['min_rows']=='2345'
+    path.rename(tmp_path/'moved-policy.json')
+    offline=api.diff(DiffRequest(result.output_dir,str(tmp_path/'offline-configured')))
+    assert offline.assessment_policy==result.assessment_policy
+    assert offline.items==result.items and offline.summary==result.summary
+    assert verify(tmp_path/'configured')['files']['assessment_rules.json']
+
+
+def test_bad_rule_configuration_is_rejected_before_connection(tmp_path, online, monkeypatch):
+    bundle, profiles, _, _=online
+    path=tmp_path/'bad-policy.json';path.write_text('{"selected":["UNKNOWN"]}')
+    monkeypatch.setattr(api,'Database',lambda *a,**k:pytest.fail('Invalid configuration connected to database'))
+    with pytest.raises(PCCError) as exc:
+        api.compare(CompareRequest(bundle.path,'old','new',str(tmp_path/'bad'),rules_config=str(path)),profiles=profiles)
+    assert exc.value.code=='RULE_CONFIG_INVALID'
+
+
+def test_offline_version_selection_ignores_unversioned_skipped_observations(tmp_path, online, monkeypatch):
+    bundle, profiles, _, capture = online
+    profiles['new']['expected_version'] = 'v8.5.7'
+    def mixed(q, side, profile, **kwargs):
+        if q.sql_text == 'SELECT 0':
+            return PlanSnapshot(q.query_id, side, capture_status='skipped')
+        return capture(q, side, profile, **kwargs)
+    monkeypatch.setattr(api, 'capture_plan', mixed)
+    original = api.compare(CompareRequest(bundle.path, 'old', 'new', str(tmp_path/'mixed')), profiles=profiles)
+    offline = api.diff(DiffRequest(original.output_dir, str(tmp_path/'offline-mixed')))
+    assert original.summary['not_run'] == '1' and offline.items == original.items
+    assert offline.assessment_policy == original.assessment_policy
+    assert offline.assessment_policy['profile_id'] == 'tidb-6.5.12-to-8.5.7'
+    assert offline.assessment_policy['actual_versions'] == {'old': '6.5.12', 'new': '8.5.7'}
+
+
 def test_rule_facts_and_groups_are_core_artifacts_and_replay_identically(tmp_path, monkeypatch, online):
     bundle, profiles, _, _ = online
     def capture(q, side, profile, **kwargs):
@@ -126,6 +209,46 @@ def test_resume_rejects_version_drift(tmp_path, online):
     with pytest.raises(PCCError) as err:
         api.compare(CompareRequest(bundle.path, "old", "new", output, resume=True), profiles=profiles)
     assert err.value.code == "RESUME_MISMATCH"
+
+
+def test_resume_recaptures_legacy_partial_statistics(tmp_path, monkeypatch, online):
+    bundle, profiles, calls, capture = online
+    cancel = threading.Event()
+    def cold_legacy(q, side, profile, **kwargs):
+        snapshot = capture(q, side, profile, **kwargs)
+        snapshot.rows[0][-1] = "stats:partial[id:unInitialized]"
+        cancel.set()
+        return snapshot
+    monkeypatch.setattr(api, "capture_plan", cold_legacy)
+    request = CompareRequest(bundle.path, "old", "new", str(tmp_path / "legacy"), concurrency=1)
+    with monkeypatch.context() as old_build:
+        old_build.setattr(api, "VERSIONS", {**api.VERSIONS, "assessment_version": "6"})
+        api.compare(request, profiles=profiles, cancel=cancel)
+    assert len(calls) == 1
+    cold_key = calls[0]
+    monkeypatch.setattr(api, "capture_plan", capture)
+    from dataclasses import replace
+    result = api.compare(replace(request, resume=True), profiles=profiles)
+    assert result.exit_code == 0 and result.summary["same"] == "4"
+    assert len(calls) == 9 and calls.count(cold_key) == 2
+
+
+@pytest.mark.parametrize("stats", ["pseudo", "partial[id:unInitialized]"])
+def test_offline_rechecks_legacy_incomplete_statistics(tmp_path, monkeypatch, online, stats):
+    bundle, profiles, _, capture = online
+    def legacy_capture(q, side, profile, **kwargs):
+        snapshot = capture(q, side, profile, **kwargs)
+        snapshot.rows[0][-1] = "stats:" + stats
+        return snapshot
+    monkeypatch.setattr(api, "capture_plan", legacy_capture)
+    original = api.compare(CompareRequest(bundle.path, "old", "new", str(tmp_path / "legacy")), profiles=profiles)
+    assert original.summary["same"] == "4"
+    first = api.diff(DiffRequest(original.output_dir, str(tmp_path / "rechecked")))
+    second = api.diff(DiffRequest(first.output_dir, str(tmp_path / "rechecked-again")))
+    assert first.exit_code == 3 and first.summary["incomparable"] == "4"
+    assert first.items == second.items and first.summary == second.summary
+    for item in first.items:
+        assert {(i["side"], i["code"]) for i in item["issues"]} == {("old", "STATS_NOT_READY"), ("new", "STATS_NOT_READY")}
 
 
 def test_drift_never_completed(tmp_path, monkeypatch, online):

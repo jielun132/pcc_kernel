@@ -48,7 +48,8 @@ def test_report_has_three_exclusive_outcomes_and_defaults_to_all(tmp_path, snaps
     articles = [Tags(record['html']).attrs('article')[0] for record in records]
     assert [a['data-status'] for a in articles] == ['same', 'changed', 'incomparable', 'not_run']
     assert [a['data-category'] for a in articles] == ['same', 'changed', 'unavailable', 'unavailable']
-    assert next(a for a in tags.attrs('option') if 'selected' in a)['value'] == ''
+    status_select = Tags(re.search(r'<select id="status"[^>]*>(.*?)</select>', text, re.S)[1])
+    assert next(a for a in status_select.attrs('option') if 'selected' in a)['value'] == ''
     buttons = [b for b in tags.attrs('button') if 'data-filter' in b]
     assert [b['data-filter'] for b in buttons if b['aria-pressed'] == 'true'] == ['']
     assert '<b>1</b><small>存在差异</small>' in text
@@ -69,6 +70,25 @@ def test_report_focuses_plan_and_keeps_rules_and_evidence_available_on_demand(tm
     assert '核心比对逻辑与规则口径' in text and '差异证据' in text
     assert {b['data-copy-plan'] for b in tags.attrs('button') if 'data-copy-plan' in b} == {'old', 'new', 'both'}
     assert {b['id'] for b in tags.attrs('button') if b.get('id') in {'previous-query','next-query'}} == {'previous-query','next-query'}
+
+
+def test_review_basis_tracks_raw_plans_even_when_automatic_result_is_unchanged(tmp_path, snapshot):
+    q = QueryCase.create('SELECT 1', 'demo')
+    plans = {(q.query_id, s): snapshot([['TableDual_1', '1', 'root', '', 'rows:1']], side=s, query_id=q.query_id)
+             for s in ('old', 'new')}
+    def render():
+        result, irs = api._summarize([q], plans, 'same-comparison-inputs', [])
+        render_reports(tmp_path, result, [q], plans, irs, {}, {})
+        text = (tmp_path / 'report.html').read_text()
+        record = json.loads(re.search(r'<script type="application/json" id="report-data">(.*?)</script>', text, re.S)[1])[0]
+        return record['reviewBasis'], result.items[0]['assessment']
+    first, original = render()
+    plans[q.query_id, 'old'].captured_at = 'different-capture-time'
+    assert render() == (first, original)
+    for plan in plans.values():
+        plan.rows[0][-1] = 'rows:2'
+    changed, after = render()
+    assert after == original and changed != first
 
 
 def test_all_same_remain_visible_and_only_empty_report_has_empty_state(tmp_path, snapshot):
