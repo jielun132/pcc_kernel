@@ -84,6 +84,8 @@ row/JSON 的列名别名和数值表示进入同一 IR；目前没有跨版本�
 
 0.1.6 使用 `assessment_version=6`。规则判断区分默认必审与运行时提示。D01/D02、D08、D10 保留会影响结论的缺口，D03–D07、D09、D11–D13 记录供实测核对的信息。原始 plan、比较状态、差异事件和退出码独立保存，已有 v3–v5 采集检查点仍按原输入指纹及文件哈希验证。
 
+0.2.0 使用 `assessment_version=8`。按查询块解析星号输出列、写语句的目标表和聚合归属。原始计划比较与所选运行时复核分别计数，`summary.review_basis.selected_runtime` 表示仅由已选运行时卡触发的复核条数。
+
 0.1.7 使用 `assessment_version=7`，收紧 A02/A03/A12/A17 的引擎、访问对象及角色前提。`plan/rule_config.py` 校验外部规则文本、选择、阈值和版本方案，底层证明算法不由配置替换；配置归档到 `assessment_rules.json`，离线重算默认继承。人工评审由 `render/review.py` 保存为独立结论，原始证据或规则配置变化后需要重新确认。菜单 2/3 的第一轮 EXPLAIN 归档为 `PlanWarmup`，第二轮独立采集才产生 `ComparisonResult`。
 
 ## 状态与产物
@@ -106,7 +108,9 @@ HTML 以“执行计划一致 / 存在差异 / 无法比对”三类互斥统计
 
 复制使用原始 row 计划，JSON 计划则按原始算子 ID 和字段还原带分支的文本，包含折叠节点的完整属性。剪贴板不可用时尝试本地复制，仍被拒绝则显示选中文本并提示手动复制，不显示虚假的成功提示。
 
-原 `summary.events` 继续表示所有底层观察事件，事件增加 `compare_status` 标识其 SQL 的比较状态。`confirmed_events` 仅计 changed SQL 中的事件，`unconfirmed_events` 计其余观察。`plan_findings` 和 `auxiliary_findings` 仅计确认的归并事实及辅助指标；无法比对的事实保留 `confirmed=false`，不计入这些差异统计或相似分组。
+启用文本等价规则时，完整命中的 SQL 计入 `same`，逐字段依据写入 `items.jsonl` 的 `text_equivalence`。其余 SQL 沿用完整事件序列，`summary.events` 统计这些事件。`confirmed_events` 计 changed SQL 的事件，`unconfirmed_events` 计其余观察。`plan_findings` 和 `auxiliary_findings` 计确认的归并事实及辅助指标。每条差异 SQL 的 `change_summary` 源于对应的 old/new 事实。
+
+人工评审组叠加完整变化的位置、方向、规则覆盖和实际预判结果。DBA 应用代表 SQL 的结论时，每个成员保存自己的证据指纹和来源 SQL。重新判断时重新计算组成员。
 
 ```text
 capture_bundle/
@@ -119,7 +123,7 @@ comparison_result/
   findings.jsonl, similar_groups.json
   assessment_rules.json, assessments.jsonl
   inputs/, plans/, ir/
-  events.jsonl, checkpoint.json, differences.csv, report.html
+  events.jsonl, checkpoint.json, differences.csv, report-<UTC timestamp>-<suffix>.html
 ```
 
 JSON 中计数、纳秒和估算数值使用十进制字符串，内部使用 int / Decimal。文件清单包含哈希及契约、IR、归一化、匹配、差异算法版本。业务结果指纹排除运行时间等非业务元数据；恢复还核对材料、精确版本和上下文。

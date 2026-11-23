@@ -1,13 +1,16 @@
 import csv
 import html
+import secrets
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 
 from pcc_tool import __version__
 from pcc_tool.artifacts.store import atomic_writer
 from pcc_tool.models import business_value, canonical, digest, primitive
+from pcc_tool.plan.text_equivalence import TEXT_RULES
 from pcc_tool.render.findings import comparison_method, findings_panel, grouping_panel, unavailable_reason
-from pcc_tool.render.navigation import NAV_STYLES, SCRIPT, navigation_chunks, plan_copy_text, plan_group
+from pcc_tool.render.navigation import NAV_STYLES, SCRIPT, navigation_chunks, plan_copy_text, plan_group, review_pattern
 from pcc_tool.render.assessment import ASSESSMENT_SCRIPT, ASSESSMENT_STYLES, assessment_markup
 
 STATUS_LABELS = {"same": "执行计划一致", "changed": "存在差异", "incomparable": "无法比对", "not_run": "无法比对"}
@@ -381,7 +384,8 @@ def report_overview(selection, context, result, queries, snapshots):
     windows = sorted({(origin["summary_begin_time"], origin["summary_end_time"]) for origin in origins
                       if origin.get("summary_begin_time") and origin.get("summary_end_time")})
     cards = [
-        ("时间范围", time_range), ("筛选库", selection.get("schemas") or "未指定"),
+        ("时间范围", time_range), ("筛选库", selection.get("schemas") or
+                              ("全部业务库" if selection.get("excluded_system_schemas") else "未指定")),
         ("SQL 类型", [str(s).upper() for s in selection.get("statement_types", [])] or "未记录"),
         ("筛选方式", method), ("排名指标", metrics or "未记录"), ("来源集群", clusters or "未记录"),
         ("源端版本", context.get("version")),
@@ -479,6 +483,8 @@ def _report_records(result, queries, snapshots, irs, writer):
     for index, item in enumerate(result.items, 1):
         q = query_by_id[item["query_id"]]
         events = diffs_by_query.get(q.query_id, [])
+        summary = item.get("change_summary", "")
+        text_rules = list(dict.fromkeys(m["rule"] for m in item.get("text_equivalence", [])))
         for event in events or [None]:
             writer.writerow([csv_safe(v) for v in (q.query_id, q.schema, item["compare_status"], q.sql_text,
                 event.type if event else "", event.field if event else "", canonical(event.old) if event else "",
@@ -486,7 +492,7 @@ def _report_records(result, queries, snapshots, irs, writer):
                 canonical(q.parameters) if q.parameters is not None else "", item.get("assessment", {}).get("status", ""),
                 " / ".join(item.get("assessment", {}).get("reasons", [])),
                 " / ".join(r["rule_id"] + " · " + r["reason"] + " " + r["check"]
-                           for r in item.get("assessment_evidence", {}).get("runtime_notes", [])))])
+                           for r in item.get("assessment_evidence", {}).get("runtime_notes", [])), summary, ",".join(text_rules))])
         anchor = f"query-{index}"
         sides = []
         for side in ("old", "new"):
@@ -507,7 +513,19 @@ def _report_records(result, queries, snapshots, irs, writer):
         diff_html = (f'<details class="field-records"><summary>{record_label} · {len(events)} 条</summary>'
                      f'{"".join(diff_parts)}</details>') if events else ''
         status = item["compare_status"]
-        needs_attention = status != "same" or item.get("requires_review", False)
+        summary_html = ""
+        if summary:
+            label = "变化摘要" if status == "changed" else "已观察到的变化（无法完整比对）"
+            summary_html = f'<section class="change-summary"><h3>{label}</h3><p>{escaped(summary)}</p></section>'
+            if status == "changed":
+                summary_html = f"<noscript>{summary_html}</noscript>"
+        if text_rules:
+            explanations = "、".join(TEXT_RULES[key] for key in text_rules)
+            summary_html = (f'<details class="text-equivalence"><summary>按文本规则判为一致 · {escaped(explanations)}</summary>'
+                            f'<pre>{escaped(item["text_equivalence"])}</pre></details>')
+        mandatory = bool(item.get("assessment_evidence", {}).get("mandatory_reviews"))
+        # The browser applies the current runtime selection after each reassessment.
+        needs_attention = status != "same" or mandatory
         note = unavailable_reason(item, ISSUE_LABELS)
         facts_html = findings_panel(item, events, anchor)
         case_label = " · ".join(dict.fromkeys(str(o["case_id"]) for o in q.sample_origins if o.get("case_id")))
@@ -520,7 +538,7 @@ def _report_records(result, queries, snapshots, irs, writer):
                      f'<pre class="sql">{escaped(q.sql_text or "缺少可执行样例")}</pre>'
                      + (f'<details class="parameters"><summary>参数 · {len(q.parameters)} 个</summary><p class="overview-note">参数样例用于重新优化，不复现计划缓存。</p><pre>{escaped(q.parameters)}</pre></details>' if q.parameters is not None else '')
                      +
-                     f'{note}<div class="query-assessment" aria-live="polite"></div>{facts_html}<div class="plan-toolbar"><h3>执行计划</h3>'
+                     f'{summary_html}{note}<div class="query-assessment" aria-live="polite"></div>{facts_html}<div class="plan-toolbar"><h3>执行计划</h3>'
                      '<div class="plan-actions"><label><input class="expand-plan" type="checkbox"> 展开详情</label>'
                      '<button type="button" class="copy-plan" data-copy-plan="both">复制两侧</button></div></div>'
                      '<div class="plan-meta"><div class="legend"><span><mark class="removed">旧值</mark></span><span><mark class="added">新值</mark></span></div>'
@@ -530,15 +548,23 @@ def _report_records(result, queries, snapshots, irs, writer):
                      f'<p class="id">{escaped(q.query_id)}</p>{diff_html}<div class="raw-plans">{"".join(sides)}</div>'
                      f'<details><summary>排名、来源、覆盖与问题</summary><pre>{escaped({"metrics": q.metrics, "origins": q.sample_origins, "item": item})}</pre></details></details></article>')
         group_key, group_title = plan_group(irs, q.query_id, status)
+        batch_eligible = status == "changed" and group_key and not mandatory
+        review_facts = []
+        for fact in item.get("findings", []):
+            operators = list(dict.fromkeys(n["operator"] for side in ("old", "new") for n in fact[side]))
+            label = fact["title"] + ("（" + " / ".join(operators[:2]) + "）" if operators else "")
+            review_facts.append(dict(category=fact["category"], refs=fact["event_refs"], label=label, operators=operators))
         yield dict(id=anchor, queryId=q.query_id, number=index, schema=q.schema, status=status, category=category,
                             reviewBasis=digest(business_value({"query": q, "comparison": item, "diffs": events,
                                 "plans": [snapshots.get((q.query_id, side)) for side in ("old", "new")]})),
-                            attention=needs_attention, needsSample=bool(item.get("needs_sample")),
+                            changeSummary=summary, reviewFacts=review_facts, textRules=text_rules, attention=needs_attention, needsSample=bool(item.get("needs_sample")),
                             assessment=item.get("assessment"), assessmentEvidence=item.get("assessment_evidence", dict(
                                 scope=status, event_refs=[str(i) for i in range(1, len(events) + 1)], matches=[], hints=[], blockers=["没有规则证据"])),
                             planGroup=group_key, planTitle=group_title,
+                            reviewPattern=review_pattern(q.statement_type, group_key, events, item["issues"]) if batch_eligible else "",
+                            eventKeys=[digest([e.old, e.new]) for e in events] if batch_eligible else [],
                             preview=" ".join((q.sql_text or "缺少可执行样例").split())[:100],
-                            search=(q.schema + " " + q.query_id + " " + case_label + " " + (q.sql_text or "") + " " +
+                            search=(q.schema + " " + q.query_id + " " + case_label + " " + (q.sql_text or "") + " " + summary + " " +
                                     " ".join(r["rule_id"] for group in ("mandatory_reviews", "runtime_notes")
                                              for r in item.get("assessment_evidence", {}).get(group, [])) + " " +
                                     " ".join(tree_text(irs.get((q.query_id, side))) for side in ("old", "new"))).lower(),
@@ -564,6 +590,11 @@ def render_reports(root, result, queries, snapshots, irs, selection, context):
     rate = result.summary.get("complete_comparison_rate")
     rate_text = f"{Decimal(rate) * 100:.2f}%" if rate is not None else "N/A"
     report += f'<div class="report-footnote"><p class="coverage">已完整比较 {escaped(result.summary.get("full_comparisons", "0"))} / {len(result.items)} 条 · {rate_text}</p>'
+    enabled = result.assessment_policy.get("text_equivalence_rules", [])
+    if enabled:
+        names = "、".join(TEXT_RULES[key] for key in enabled)
+        report += (f'<p class="coverage">其中 {escaped(result.summary["text_equivalent"])} 条按文本规则判为一致。'
+                   f'本次启用 {escaped(names)}。调整文本规则后可离线重算。</p>')
     report += '<details class="report-context"><summary>报告说明</summary><div class="report-context-body">'
     report += (f'<p class="count-equation">{len(result.items)} 条样例 = '
                f'{escaped(result.summary.get("same", "0"))} 条一致 + {escaped(result.summary.get("changed", "0"))} 条存在差异 + '
@@ -575,11 +606,14 @@ def render_reports(root, result, queries, snapshots, irs, selection, context):
     report += report_overview(selection, context, result, queries, snapshots) + comparison_method()
     report += grouping_panel(result.items, queries) + '</div></details></div></header>'
     report += assessment_markup(result.fingerprint, result.assessment_policy)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%fZ")
+    report_path = root / f"report-{stamp}-{secrets.token_hex(3)}.html"
     with atomic_writer(root / "differences.csv", "w", encoding="utf-8-sig", newline="") as csv_file, \
-            atomic_writer(root / "report.html", "w", encoding="utf-8", newline="") as html_file:
+            atomic_writer(report_path, "w", encoding="utf-8", newline="") as html_file:
         writer = csv.writer(csv_file)
         writer.writerow(["query_id", "schema", "compare_status", "sql_text", "event", "field", "old", "new", "requires_review", "parameters",
-                         "assessment", "review_reasons", "runtime_notes"])
+                         "assessment", "review_reasons", "runtime_notes", "change_summary", "text_equivalence_rules"])
         html_file.write(report)
         html_file.writelines(navigation_chunks(_report_records(result, queries, snapshots, irs, writer)))
         html_file.write('</main><script>' + ASSESSMENT_SCRIPT + SCRIPT + '</script></body></html>')
+    return report_path

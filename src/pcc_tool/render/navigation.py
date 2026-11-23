@@ -1,5 +1,6 @@
 """Offline report browsing. Group membership is never an approval decision."""
 import json
+from decimal import Decimal
 from itertools import chain
 
 from pcc_tool.models import canonical, digest
@@ -18,6 +19,22 @@ def plan_group(irs, query_id, status):
     signature = digest(shapes)
     roots = [" + ".join(node.operator for node in ir.roots) for ir in pair]
     return signature, roots[0] if roots[0] == roots[1] else " → ".join(roots)
+
+
+def review_pattern(statement, plan_key, events, issues):
+    """Describe the whole directed change. The browser refines it with active rule evidence."""
+    changes = []
+    for event in events:
+        direction = None
+        if event.type == "estimate_changed":
+            if event.old is not None and event.new is not None:
+                direction = "increase" if Decimal(event.new) > Decimal(event.old) else "decrease"
+            direction = [direction, event.old in (None, "0"), event.new in (None, "0")]
+        elif event.type in {"access_path_changed", "task_or_engine_changed", "child_order_changed", "join_changed"}:
+            direction = [event.old, event.new]
+        changes.append([event.type, event.old_node, event.new_node, direction])
+    warnings = [{k: v for k, v in issue.items() if k != "query_id"} for issue in issues]
+    return digest([statement, plan_key, changes, warnings])
 
 
 def plan_copy_text(snapshot, ir):
@@ -67,9 +84,10 @@ def navigation_chunks(records):
 <aside class="sql-sidebar" aria-label="SQL 浏览目录">
   <div class="sidebar-heading"><h2>SQL 目录</h2><span id="visible-count" aria-live="polite"></span></div>
   <div class="filters"><input id="search" type="search" aria-label="搜索 SQL、对象或标识" placeholder="搜索 SQL、表名…"></div>
-  <div class="sidebar-tools"><label class="sr-only" for="group-mode">分组方式</label><select id="group-mode"><option value="all">全部 SQL</option><option value="schema">按数据库</option><option value="plan">按相似计划</option></select><button id="clear-group" type="button" hidden>退出分组</button></div>
+  <div class="sidebar-tools"><label class="sr-only" for="group-mode">分组方式</label><select id="group-mode"><option value="all">全部 SQL</option><option value="schema">按数据库</option><option value="plan">按相似计划</option><option value="review">按同类变化评审</option></select><button id="clear-group" type="button" hidden>退出分组</button></div>
   <p id="group-help" class="sidebar-note"></p><div id="group-list"></div>
   <details class="scope-settings"><summary>筛选与范围</summary>
+    <label for="review-filter">人工评审筛选</label><select id="review-filter"><option value="">全部</option><option value="pending">未完成评审</option><option value="reviewed">已评审</option><option value="stale">需重新确认</option></select>
     <label for="status">比较状态</label><select id="status"><option value="" selected>全部状态</option><option value="changed">存在差异</option><option value="same">执行计划一致</option><option value="unavailable">无法比对</option><option value="attention">需关注（差异、无法比对、待复核）</option><option value="incomparable">比较未完成</option><option value="not_run">未运行</option><option value="needs_sample">缺少样例</option></select>
     <h3>本次暂不审核</h3><p class="sidebar-note">勾选库后隐藏，不计为通过；刷新后恢复。</p><div id="schema-scope"></div>
     <details><summary>分组口径</summary><p class="sidebar-note">按默认数据库归类，跨库依赖仍保留。相似计划按 old / new 两棵有序树的算子、角色、任务和引擎归类，忽略表名、谓词与估算值；各条 SQL 仍需独立评审。</p></details>
@@ -118,42 +136,51 @@ const skipped=new Set();
 const labels={same:'一致',changed:'有差异',incomparable:'无法比对',not_run:'无法比对'};
 function element(tag,text,className){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el;}
 const assessment=typeof PCCAssessment==='undefined'?null:PCCAssessment.attach(records,clearView=>{
-  if(clearView){activeGroup=null;activeKey=null;search.value='';status.value='';skipped.clear();}resetPage();
-});
+  if(clearView==='review-edit'){render(true);return;}
+  if(clearView){activeGroup=null;activeKey=null;search.value='';status.value='';skipped.clear();resetPage();}else render();
+},()=>filtered);
 function statusMatch(r){const s=status.value;return s==='attention'?r.attention||assessment?.status(r)==='review':s==='needs_sample'?r.needsSample:s==='unavailable'?r.category==='unavailable':!s||r.status===s;}
 function baseMatch(r){return (!assessment||assessment.matches(r))&&!skipped.has(r.schema)&&statusMatch(r)&&r.search.includes(search.value.trim().toLowerCase());}
-function groupValue(r){return mode.value==='schema'?r.schema:r.planGroup;}
+function groupValue(r){return mode.value==='review'?assessment?.groupId(r)||'':mode.value==='schema'?r.schema:r.planGroup;}
 function buildGroups(){
   const list=document.getElementById('group-list'), scroll=list.scrollTop;list.replaceChildren();
-  document.getElementById('group-help').textContent=mode.value==='plan'?'结构相似，仍需逐条判断。':mode.value==='schema'?'按 SQL 默认数据库归类。':'';
+  document.getElementById('group-help').textContent=mode.value==='review'?'同组 SQL 的整份计划变化和生效规则相符。先确认一条，再应用人工结论。':mode.value==='plan'?'按两端计划结构归类。':mode.value==='schema'?'按 SQL 默认数据库归类。':'';
   if(mode.value==='all')return;
   const groups=new Map();
   records.filter(baseMatch).forEach(r=>{const key=groupValue(r);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(r);});
   const all=element('button','显示全部分组','group-choice');all.type='button';all.dataset.allGroups='';all.setAttribute('aria-pressed',String(activeKey===null));list.append(all);
-  [...groups].sort((a,b)=>mode.value==='plan'?b[1].length-a[1].length:0).forEach(([key,members])=>{
+  [...groups].sort((a,b)=>{
+    if(mode.value==='schema')return 0;
+    if(mode.value==='review'&&Boolean(a[0])!==Boolean(b[0]))return a[0]?-1:1;
+    return b[1].length-a[1].length;
+  }).forEach(([key,members])=>{
     const b=element('button',undefined,'group-choice');b.type='button';b.dataset.groupKey=key;b.setAttribute('aria-pressed',String(key===activeKey));
-    const name=mode.value==='schema'?(key||'全限定 SQL / 未指定库'):(key?`结构组 ${planNumbers.get(key)} · ${members[0].planTitle}`:'计划不完整 / 未分组');
+    const name=mode.value==='review'?(key?`评审组 ${key} · ${members[0].planTitle}`:'单独评审 / 无同组变化'):
+      mode.value==='schema'?(key||'全限定 SQL / 未指定库'):(key?`结构组 ${planNumbers.get(key)} · ${members[0].planTitle}`:'计划不完整 / 未分组');
     b.append(element('strong',`${name} · ${members.length} 条`));
     const counts=['same','changed','unavailable'].map(s=>members.filter(r=>r.category===s).length);
     b.append(element('small',counts.map((count,i)=>count?`${['一致','差异','无法比对'][i]} ${count}`:'').filter(Boolean).join(' · ')));list.append(b);
   });
   list.scrollTop=scroll;
 }
-function render(){
+function render(keepEditor=false){
   filtered=records.filter(r=>baseMatch(r)&&(!activeGroup||activeGroup.has(r.id))&&(activeKey===null||groupValue(r)===activeKey));
   const size=Number(pageSize.value), pages=Math.max(1,Math.ceil(filtered.length/size));page=Math.min(Math.max(0,page),pages-1);
   const visible=filtered.slice(page*size,(page+1)*size);
-  const selected=visible.find(r=>r.id===activeId)||visible[0];activeId=selected?.id||null;
+  // Finishing a pending item removes its directory entry. Keep its editor until the DBA leaves it.
+  const editing=keepEditor&&byId.get(activeId);
+  const selected=editing||visible.find(r=>r.id===activeId)||visible[0];activeId=selected?.id||null;
   // HTML was generated and escaped by the report renderer, never composed from search/input values.
-  if(!selected||!document.getElementById(selected.id))document.getElementById('sql-cards').innerHTML=selected?.html||'';
-  assessment?.detail(selected);
+  const sameCard=selected&&document.getElementById(selected.id);
+  if(!sameCard)document.getElementById('sql-cards').innerHTML=selected?.html||'';
+  if(!keepEditor||!sameCard)assessment?.detail(selected);
   const nav=document.getElementById('sql-nav');nav.replaceChildren();
   visible.forEach(r=>{
     const a=element('a');a.href='#'+r.id;a.dataset.queryLink='';a.dataset.status=r.status;a.setAttribute('aria-current',String(r.id===activeId));
     const heading=element('span',undefined,'nav-item-heading');heading.append(element('strong',`#${String(r.number).padStart(3,'0')}`),element('small',labels[r.status]));
     const schema=element('span',r.schema||'未指定库','nav-schema');schema.setAttribute('title',r.schema||'未指定库');
     a.append(heading,element('span',r.preview,'nav-preview'),schema);
-    if(assessment&&assessment.status(r)!=='excluded')a.append(element('span',assessment.label(r),'nav-assessment assessment-'+assessment.status(r)));
+    const verdict=assessment?.label(r);if(verdict)a.append(element('span',verdict,'nav-assessment'));
     nav.append(a);
   });
   document.getElementById('page-state').textContent=`${page+1} / ${pages}`;
@@ -161,10 +188,10 @@ function render(){
   document.getElementById('visible-count').textContent=filtered.length===records.length?`${records.length} 条`:`${filtered.length} / ${records.length} 条`;
   const scopeCount=document.getElementById('scope-count');scopeCount.hidden=skipped.size===0;scopeCount.textContent=`暂不审核 ${skipped.size} 个库 · ${records.filter(r=>skipped.has(r.schema)).length} 条`;
   const position=selected?filtered.indexOf(selected):-1;
-  document.getElementById('detail-position').textContent=selected?`${position+1} / ${filtered.length} 条 SQL`:'';
-  document.getElementById('previous-query').disabled=position<=0;document.getElementById('next-query').disabled=position<0||position>=filtered.length-1;
+  document.getElementById('detail-position').textContent=position>=0?`${position+1} / ${filtered.length} 条 SQL`:selected?`SQL #${selected.number} 已移出当前筛选 · 剩余 ${filtered.length} 条`:'';
+  document.getElementById('previous-query').disabled=position<=0;document.getElementById('next-query').disabled=!filtered.length||position>=filtered.length-1;
   document.getElementById('clear-group').hidden=!activeGroup&&activeKey===null;
-  document.getElementById('empty').hidden=filtered.length!==0;
+  document.getElementById('empty').hidden=!!selected;
   metrics.forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.filter===status.value)));
   document.querySelectorAll('[data-skip-schema]').forEach(c=>{c.checked=skipped.has(c.dataset.skipSchema);});
   buildGroups();

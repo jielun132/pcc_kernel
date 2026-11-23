@@ -55,9 +55,20 @@ nodes['report-data'].textContent=JSON.stringify(records);
 records.forEach(r=>{r.queryId??='q-'+r.number;r.assessmentEvidence??={scope:r.status,event_refs:r.status==='changed'?['1']:[],matches:r.status==='changed'?[{id:'m1',rule_id:'E01',direction:'equivalent',event_refs:['1'],old_nodes:['n0'],new_nodes:['n0'],guards:[],reason:'展示别名'}]:[],blockers:[],hints:[]};});
 if(!process.argv[3])records[0].assessmentEvidence.mandatory_reviews=[{rule_id:'D01',reason:'空表可能折叠标量子查询',check:'在有数据的隔离库比较'}];
 if(!process.argv[3])records[3].assessmentEvidence.runtime_notes=[{rule_id:'D05',reason:'第 K 行位置未知',check:'用有代表性的数据核对扫描量'}];
+if(!process.argv[3]){
+  records[0].textRules=['projection_alias'];records[6].textRules=['projection_alias'];
+  // Archives serialize dictionaries in key order, while the live evaluator returns status first.
+  records[1].assessment={matched:['m1'],reasons:[],status:'equivalent',uncovered:[]};
+  for(const n of [2,5,8,11,14,17,20,23]){
+    const r=records[n-1];r.reviewPattern=n===17?'reverse':'forward';r.eventKeys=['raw-'+n];r.reviewBasis='basis-'+n;
+    if(n!==14)r.search+=' batch-scope';
+  }
+  records[19].assessmentEvidence.mandatory_reviews=[{rule_id:'D02',reason:'逐条核对',check:'核验数据'}];
+  records[22].assessmentEvidence.event_refs.push('2');records[22].eventKeys.push('extra');
+}
 const archivedAssessments=records.map(r=>r.assessment?JSON.parse(JSON.stringify(r.assessment)):null);
 nodes['report-data'].textContent=JSON.stringify(records);
-for(const id of ['assessment-config','assessment-panel','assessment-state','assessment-counts','run-assessment','export-assessment-json','export-assessment-csv','rule-profile','profile-state','review-state','review-filter','save-reviews','import-reviews',...Object.keys(config.thresholds).map(k=>'threshold-'+k)]){
+for(const id of ['assessment-config','assessment-panel','assessment-state','assessment-counts','run-assessment','export-assessment-json','export-assessment-csv','rule-profile','profile-state','review-overview','review-state','review-filter','save-reviews','import-reviews','review-progress','review-progress-bar','review-scope','review-counts','review-ledger','review-ledger-list','export-review-summary',...Object.keys(config.thresholds).map(k=>'threshold-'+k)]){
   const n=new Element(id.startsWith('threshold')?'input':id.startsWith('export-')||id==='run-assessment'?'button':'div');n.id=id;nodes[id]=n;doc.append(n);
 }
 nodes['assessment-config'].textContent=JSON.stringify(config);
@@ -113,6 +124,15 @@ async function checks(){
   assert.equal(initial.results.length,records.length);
   initial.results.forEach((r,i)=>{if(archivedAssessments[i])assert.deepEqual(r.result,archivedAssessments[i]);});
   assert.equal(initial.results.filter(r=>r.result.status!=='excluded').length,inScope);
+  if(read("typeof assessment.groupId==='function'")){
+    change('review-filter','pending');assert.equal(read('filtered.length'),inScope);
+    assert.ok(read("filtered.every(r=>assessment.status(r)!=='excluded')"));
+    if(!process.argv[3]){
+      assert.ok(read("filtered.some(r=>r.id==='query-1')"));
+      assert.ok(!read("filtered.some(r=>r.id==='query-7')"));
+    }
+    change('review-filter','');
+  }
   const preset=key=>doc.querySelectorAll('[data-rule-preset]').find(b=>b.dataset.rulePreset===key);
   click(preset('none'));assert.equal(read('assessment.isDirty()'),true);assert.equal(nodes['export-assessment-json'].disabled,true);
   assert.deepEqual(JSON.parse(JSON.stringify(read('assessment.payload()'))),initial);
@@ -171,6 +191,20 @@ async function checks(){
   const checked=detail.querySelector('[data-review-checked]');checked.checked=true;checked.fire('change');
   let human=JSON.parse(JSON.stringify(read('assessment.payload()')));assert.equal(human.results[0].manual_review.reviewed,true);
   assert.equal(human.results[0].manual_review.conclusion,'worse');assert.deepEqual(human.results[0].result,initial.results[0].result);
+  if(human.manual_review_summary){
+    const scoped=human.results[0].result.status!=='excluded',view=key=>nodes['review-counts'].children.find(b=>b.dataset.reviewView===key);
+    assert.equal(human.manual_review_summary.reviewed,Number(scoped));assert.equal(human.manual_review_summary.outside,Number(!scoped));
+    assert.equal(detail.querySelector('.review-verdict').textContent,'人工已评审 · 变差');
+    assert.match(nodes['sql-nav'].children[0].textContent,/人工已评审 · 变差/);
+    click(view(scoped?'worse':'outside'));const ledger=nodes['review-ledger-list'];
+    assert.equal(ledger.querySelectorAll('[data-review-row]').length,1);assert.ok(ledger.textContent.includes(note.value));
+    verdict.value='better';verdict.fire('change');
+    assert.equal(detail.querySelector('[data-review-conclusion]'),verdict);
+    if(scoped){assert.equal(ledger.querySelectorAll('[data-review-row]').length,0);click(view('better'));}
+    assert.match(ledger.textContent,/人工已评审 · 变优/);click(ledger.querySelector('a'));assert.equal(read('activeId'),'query-1');
+    const restored=doc.getElementById('query-1').querySelector('[data-review-conclusion]');restored.value='worse';restored.fire('change');
+    click(nodes['export-review-summary']);assert.ok((await downloaded.text()).includes('"\'=HYPERLINK'));nodes['review-ledger'].open=false;
+  }
   assert.equal(storage.size,1);jump(2);jump(1);assert.equal(doc.getElementById('query-1').querySelector('[data-review-note]').value,note.value);
   const evidenceBasis=read('records[0].reviewBasis');sandbox.originalBasis=evidenceBasis;
   read('records[0].reviewBasis="different-plan-evidence"');
@@ -201,6 +235,53 @@ async function checks(){
   sandbox.localStorage.setItem=()=>{throw Error('quota');};jump(1);
   const changedNote=doc.getElementById('query-1').querySelector('[data-review-note]');changedNote.value+=' more';changedNote.fire('input');
   assert.match(nodes['review-state'].textContent,/保存不可用/);click(nodes['save-reviews']);assert.equal(JSON.parse(await downloaded.text()).reviews[0].note,changedNote.value);
+  if(!process.argv[3]){
+    click(metrics[0]);click(preset('default'));click(nodes['run-assessment']);
+    const control=(n,selector)=>doc.getElementById('query-'+n).querySelector(selector);
+    function verdict(n,v,checked){
+      jump(n);const sel=control(n,'[data-review-conclusion]');sel.value=v;sel.fire('change');
+      if(checked){const box=control(n,'[data-review-checked]');box.checked=true;box.fire('change');}
+    }
+    verdict(8,'worse',true);verdict(11,'better',false);
+    jump(5);const draft=control(5,'[data-review-note]');draft.value='此条 SQL 的原备注';draft.fire('input');
+    change('group-mode','review');click(nodes['group-list'].children.find(b=>b.dataset.groupKey==='2'));
+    assert.deepEqual([...read('filtered.map(r=>r.number)')],[2,5,8,11,14]);
+    change('search','batch-scope');jump(2);
+    const button=()=>control(2,'[data-apply-review-group]');
+    assert.equal(button().disabled,true);click(button());
+    verdict(2,'equivalent',true);assert.equal(button().disabled,false);assert.match(button().textContent,/同组 1 条/);
+    click(button());
+    const reviews=read('assessment.payload().manual_reviews.reviews');
+    assert.deepEqual(Object.keys(JSON.parse(reviews.find(r=>r.query_id==='q-2').basis).result),['status','matched','uncovered','reasons']);
+    assert.equal(reviews.find(r=>r.query_id==='q-5').source_query_id,'q-2');
+    assert.equal(reviews.find(r=>r.query_id==='q-5').note,draft.value);
+    assert.notEqual(reviews.find(r=>r.query_id==='q-5').basis,reviews.find(r=>r.query_id==='q-2').basis);
+    for(const [n,v,checked] of [[2,'equivalent',true],[5,'equivalent',true],[8,'worse',true],[11,'better',false]]){
+      const entry=reviews.find(r=>r.query_id==='q-'+n);assert.equal(entry.checked,checked);assert.equal(entry.conclusion,v);
+    }
+    for(const n of [14,17,20,23])assert.equal(reviews.some(r=>r.query_id==='q-'+n),false);
+    click(nodes['save-reviews']);sandbox.batchFile=JSON.parse(await downloaded.text());
+    assert.equal(read("PCCReview.validate(batchFile,'test-report',new Set(records.map(r=>r.queryId))).get('q-5').source_query_id"),'q-2');
+    click(preset('none'));assert.equal(button().disabled,true);click(nodes['run-assessment']);
+    assert.equal(read("assessment.groupId(records[1])"),'');
+    assert.equal(read("assessment.payload().results[4].manual_review.needs_reconfirmation"),true);
+  }
+  if(!process.argv[3]){
+    const evidence={scope:'changed',event_refs:['1'],matches:[{id:'m1',rule_id:'A02',direction:'worse',event_refs:['1'],
+      reason:'反向变化：覆盖索引消除回表',guards:[]}],hints:[],blockers:[]};
+    sandbox.explainCase=evidence;
+    const explain=(selected,thresholds={})=>read(`PCCAssessment.decisionSummary({assessmentEvidence:explainCase},
+      PCCAssessment.evaluate(explainCase,${JSON.stringify(selected)},${JSON.stringify(thresholds)}),${JSON.stringify(selected)},${JSON.stringify(thresholds)})`);
+    assert.match(explain(['A02']).reason,/新计划还要按行回表/);
+    assert.match(explain([]).reason,/未启用.*A02/);
+    evidence.matches.push({...evidence.matches[0],rule_id:'A11',id:'m2',direction:'better'});
+    assert.match(explain(['A02','A11']).reason,/相反方向.*回表.*有界 TopN/);
+    evidence.matches=[{...evidence.matches[0],rule_id:'A03',direction:'better',guards:[{kind:'reduction',input:'1000',output:'400',setting:'reduction_pct',label:'候选行减少'}]}];
+    assert.match(explain(['A03'],{reduction_pct:'50'}).reason,/1000.*400.*50%/);
+    assert.match(explain(['A03'],{reduction_pct:'75'}).reason,/候选行减少未满足阈值/);
+    evidence.matches=[{...evidence.matches[0],rule_id:'A12',guards:[{kind:'ratio',input:'20000',output:'1',constant:'10',label:'中间行占比'}]}];
+    assert.match(explain(['A12']).reason,/部分聚合的估算输出行数为 1/);
+  }
   console.log('Manual review, policy staleness, persistence, atomic import validation, filters and safe export passed.');
   console.log(`Rule selection, full-scope recalculation, stale state, thresholds, filters and JSON/CSV exports passed (${changed} changed SQLs).`);
   console.log(`Navigation, paging, schema/plan groups, deferred scopes, deep links and clipboard paths passed (${records.length} SQLs).`);

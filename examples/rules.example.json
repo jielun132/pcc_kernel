@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "default_profile": "auto",
+  "text_equivalence_rules": ["projection_alias", "integer_predicates"],
   "thresholds": {
     "min_rows": 1000,
     "max_ratio_pct": 10,

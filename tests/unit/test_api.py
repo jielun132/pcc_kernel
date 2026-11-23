@@ -60,7 +60,7 @@ def test_missing_samples_denominator_and_partial_precedence(tmp_path, snapshot):
 def test_html_escaping_and_csv_formula(tmp_path, snapshot):
     q = QueryCase.create("<script>alert(1)</script>", "=HYPERLINK(1)")
     result = archive(tmp_path / "report", [q], {})
-    html = (tmp_path / "report/report.html").read_text()
+    html = (tmp_path / "report" / result.report_file).read_text()
     csv = (tmp_path / "report/differences.csv").read_text("utf-8-sig")
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;" in html

@@ -131,7 +131,7 @@ def main():
               all_executable_cases_compared=not incomplete, unresolved_cases=incomplete,
               categories=dict(Counter(c["category"] for c in cases)), row_counts=after))
     print(json.dumps(result.summary, ensure_ascii=False), flush=True)
-    print(f"Report: {out / args.report_name / 'report.html'}", flush=True)
+    print(f"Report: {result.report_path}", flush=True)
     if incomplete:
         print(f"{len(incomplete)} executable cases remain incomplete; retained in the report and validation evidence.", flush=True)
         raise SystemExit(3)

@@ -77,13 +77,15 @@ def print_result(result):
     summary = result.summary
     print(f"一致 {summary.get('same', '0')}；差异 {summary.get('changed', '0')}；"
           f"无法比对 {summary.get('incomparable', '0')}；未运行 {summary.get('not_run', '0')}。PCC 返回码：{result.exit_code}")
+    if int(summary.get("text_equivalent", 0)):
+        print(f"一致项中有 {summary['text_equivalent']} 条按本次启用的文本规则归并。")
     if assessment := summary.get("assessment"):
         print(f"规则预判（规则 v{ASSESSMENT_VERSION}）  变优 {assessment['better']}  基本等价 {assessment['equivalent']}  "
               f"变差 {assessment['worse']}  待复核 {assessment['review']}")
     if basis := summary.get("review_basis"):
         print(f"待复核原因（每条计一次）  计划可能提前读表 {basis['plan_evaluation']}  "
               f"仅有代价估算 {basis['model_only']}  缺 SQL 或视图定义 {basis['missing_definition']}  "
-              f"差异证据不足 {basis['unresolved_difference']}")
+              f"已选运行时复核 {basis.get('selected_runtime', '0')}  差异证据不足 {basis['unresolved_difference']}")
 
 
 def time_value(value, timezone):
@@ -268,8 +270,10 @@ class Menu:
             if datetime.fromisoformat(begin) >= datetime.fromisoformat(end):
                 raise PCCError("INVALID_TIME", "结束时间必须晚于开始时间")
             default_schemas = ",".join(cfg["schemas"])
-            label = "库名（逗号分隔；回车用默认，输入 * 采集全部库）" if default_schemas else "库名（逗号分隔；回车或 * 采集全部库）"
-            selected = ask(label, default_schemas)
+            label = "库名（回车或 * 采集全部业务库，多个库名用逗号分隔）"
+            if default_schemas:
+                label += f" 配置中的库名可输入 {default_schemas}"
+            selected = ask(label, "*")
             schemas = () if selected == "*" else tuple(x.strip() for x in selected.split(",") if x.strip())
             if "*" in schemas:
                 raise PCCError("INVALID_CONFIG", "采集全部库请单独输入 *，不要与库名混填")
@@ -424,12 +428,14 @@ class Menu:
         write_json(task / "task.json", state)
         self.state["report"] = str(report)
         self.save()
-        print(paint("报告：" + str(report / "report.html"), "1;32"))
+        print(paint("报告：" + result.report_path, "1;32"))
         if result.exit_code >= 2:
             print(paint("存在未完成项，请在报告中查看原因。", "33"))
 
     def reports(self):
-        reports = sorted(self.root.glob("task-*/report-*/report.html"), reverse=True)
+        reports = sorted((p for pattern in ("task-*/report-*/report*.html", "offline-*/report*.html")
+                          for p in self.root.glob(pattern) if p.name == "report.html" or p.name.startswith("report-")),
+                         key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
         for path in reports[:20]:
             print(path)
         if not reports:
@@ -467,7 +473,7 @@ class Menu:
                            rules_config=self.cfg["rules_config"] or None,
                            rule_profile=self.state.get("rule_profile") or self.cfg["rule_profile"] or None))
         print_result(result)
-        print(f"离线报告：{out / 'report.html'}")
+        print(f"离线报告：{result.report_path}")
 
     def rule_profile(self):
         from pcc_tool.plan.rule_config import load_policy

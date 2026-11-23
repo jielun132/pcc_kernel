@@ -2,7 +2,9 @@
 
 **把同一批 SQL 放到升级前、升级后的 TiDB 中，比较执行计划，并生成 HTML 报告。**
 
-当前版本 **0.1.7** · [0.1.7 Release](https://github.com/jielun132/pcc_kernel/releases/tag/v0.1.7) · [下载与所有版本](https://github.com/jielun132/pcc_kernel/releases) · [更新记录](CHANGELOG.md)
+当前正式版 **0.2.0** · [下载 v0.2.0](https://github.com/jielun132/pcc_kernel/releases/tag/v0.2.0) · [所有版本](https://github.com/jielun132/pcc_kernel/releases) · [更新记录](CHANGELOG.md)
+
+0.2.0 支持在比对时启用文本等价规则。每条差异 SQL 都有 old → new 的变化摘要，DBA 可以将代表 SQL 的人工结论应用到同组。菜单 2 直接回车会选择全部业务库，报告文件名带生成时间。[规则配置与人工评审](docs/rule-configuration.md)
 
 0.1.7 为菜单 2/3 统一增加独立预热，正式采集复查 `pseudo` / `partial` 统计；报告支持人工评审勾选、结论、备注及恢复文件。菜单 8 和报告中的版本规则方案可选择评审配置，默认匹配 `6.5.12 → 8.5.7`。外部 JSON 可调整规则选择、阈值、卡片说明和版本组合，见[规则配置与人工评审](docs/rule-configuration.md)。生产和临时环境分网时，传输完整采集包后即可在临时端自动导入，无需再连接生产。
 
@@ -16,14 +18,14 @@
 
 在能连接三套 TiDB 的 **Linux x86_64** 机器上执行，使用 Bash。原生包自带 Python；运行机需要 glibc 2.28 或以上，导入步骤另需 MySQL 8 客户端。
 
-安装包和校验文件见 [v0.1.7 Release](https://github.com/jielun132/pcc_kernel/releases/tag/v0.1.7)；从源码开发请参考[本地开发说明](CONTRIBUTING.md#本地开发)。
+安装包和校验文件见 [v0.2.0 Release](https://github.com/jielun132/pcc_kernel/releases/tag/v0.2.0)。源码安装步骤见[本地开发说明](CONTRIBUTING.md#本地开发)。
 
 ```bash
-curl -fLO https://github.com/jielun132/pcc_kernel/releases/download/v0.1.7/pcc-core-0.1.7-linux-x86_64.tar.gz
-curl -fLO https://github.com/jielun132/pcc_kernel/releases/download/v0.1.7/pcc-core-0.1.7-linux-x86_64.tar.gz.sha256
-sha256sum -c pcc-core-0.1.7-linux-x86_64.tar.gz.sha256
-tar -xzf pcc-core-0.1.7-linux-x86_64.tar.gz
-cd pcc-core-0.1.7-linux-x86_64
+curl -fLO https://github.com/jielun132/pcc_kernel/releases/download/v0.2.0/pcc-core-0.2.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/jielun132/pcc_kernel/releases/download/v0.2.0/pcc-core-0.2.0-linux-x86_64.tar.gz.sha256
+sha256sum -c pcc-core-0.2.0-linux-x86_64.tar.gz.sha256
+tar -xzf pcc-core-0.2.0-linux-x86_64.tar.gz
+cd pcc-core-0.2.0-linux-x86_64
 ./pcc --version
 cp examples/profiles.demo.json profiles.json
 vi profiles.json
@@ -99,16 +101,16 @@ sleep 5
 ./pcc --config profiles.json compare --bundle "$DEMO_DIR/bundle" \
   --old old --new new --out "$DEMO_DIR/compare" --stats-retries 5
 echo "PCC 返回码：$?"
-echo "报告位置：$DEMO_DIR/compare/report.html"
+ls "$DEMO_DIR"/compare/report*.html
 unset PCC_DB_PASSWORD MYSQL_PWD
 ```
 
-把 `report.html` 下载到电脑，用浏览器打开：
+下载输出目录中的 HTML 报告，用浏览器打开。0.2.0 的 CLI 输出包含 `report_path`，文件名使用 UTC 生成时间。
 
 - 按“执行计划一致 / 存在差异 / 无法比对”分别统计和筛选，无法比对项直接说明原因。
 - 展示差异类型、命中规则及归并事实，估算行数单列；两端计划对齐并保留字段证据。
 - 64 张规则卡区分计划证据与运行代价。D01、D02、D08、D10 命中即复核，另 9 张运行时卡默认在 SQL 详情提示，可按需加入复核。点击“待复核”查看每条 SQL 的原因、对应卡片和复核方法，支持 JSON/CSV 导出。[规则预判说明](docs/rule-assessment.md)
-- 相似差异可集中查看，仍需 DBA 逐条评审，不自动批量通过或继承结论。
+- 0.2.0 支持在“按同类变化评审”中先核对代表 SQL 的摘要、选择人工结论并勾选“已评审”，再将结论应用到列出的同组 SQL。
 - SQL 目录支持分页、搜索和按编号跳转；可按数据库或两侧完整计划结构分组。本次暂不审核的库可隐藏并恢复，原始统计不变，也不计为通过。
 - 长计划保留层级缩进、固定列头和框内滚动；旧计划、新计划或两侧文本均可一键复制。
 - 返回码 `0` 表示完整比较且一致，`1` 表示完整比较且有变化，`3` 表示部分未完成，查看报告中的原因。计划变化不等于性能变差。
@@ -117,7 +119,7 @@ unset PCC_DB_PASSWORD MYSQL_PWD
 
 ## 版本、限制和开发
 
-0.1.7 在 Community v6.5.12 和 v8.5.7 上用同一份固定材料连续采集 413 条案例，三轮均为 199 一致、197 差异、6 无法完整比对、11 未运行。规则 v7 默认判为 72 变优、99 基本等价、26 待复核，各轮与离线重算逐条一致。菜单 2 的三个独立材料包共九轮比较稳定；分网自动导入另以 60 条合成 SQL 验证。1,203 项离线回归通过，版本、分区统计、Prepared 语句及实测边界见[验证说明](docs/validation.md)。
+0.2.0 在 Community v6.5.12 → v8.5.7 的 413 条固定案例上，示例配置得到 260 条一致、136 条差异、6 条无法完整比对、11 条按用例预期未运行。空库专项验证另比较了有数据的模拟源和只导入 DDL、统计的两个目标。规则 v8 会标出派生表及写语句中可能提前读表的子查询。[验证说明](docs/validation.md)
 
 开发中的回归案例集中在 [固定 SQL 用例库](tests/cases/README.md)：413 条、17 类，历史用例只允许追加，CI 校验历史内容。报告交互测试还覆盖 1,053 条 SQL 的分页与分组，需要本机 Node.js；程序运行本身不依赖 Node.js。本地 Docker v6.5.12 / v8.5.5 的用例验证不替代客户版本认证。
 

@@ -252,9 +252,12 @@ def prepare(request: PrepareRequest, *, profiles=None, on_event=None) -> dict:
 
 
 def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, assessment_schema=None, policy=None):
-    from pcc_tool.plan.findings import classify_findings
+    from pcc_tool.plan.findings import change_summary, classify_findings
+    from pcc_tool.plan.text_equivalence import match_text_rules
     from pcc_tool.plan.assessment import detect, evaluate
     items, diffs, irs = [], [], {}
+    selected_rules = (policy or {}).get("selected")
+    thresholds = (policy or {}).get("thresholds")
     for q in queries:
         events = []
         item_issues = [i for i in issues if (not i.get("query_id") or i["query_id"] == q.query_id)
@@ -279,7 +282,6 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, asses
                 if any(e.type == "ambiguous_match" for e in events):
                     item_issues.append({"code": "PLAN_MATCH_AMBIGUOUS", "query_id": q.query_id,
                                         "message": "局部节点无法唯一对应，保留观察结果，不能完整比较"})
-                diffs.extend(events)
                 contexts = [p[0].context.get("session", {}) for p in pair]
                 if contexts[0] != contexts[1]:
                     required_context = {"sql_mode", "time_zone", "collation_connection", "character_set_connection",
@@ -293,6 +295,9 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, asses
                                         "old": contexts[0], "new": contexts[1]})
                 blocking = [i for i in item_issues if i.get("severity", "error") != "warning"]
                 if not review and not blocking:
+                    if events and (matches := match_text_rules(pair[0][1], pair[1][1], events, policy)):
+                        item["text_equivalence"] = matches
+                        events = []
                     item["compare_status"] = "changed" if events else "same"
                 item["requires_review"] = review or bool(blocking)
         elif q.executable_status == "unsupported":
@@ -305,14 +310,16 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, asses
         item["result_category"] = item["compare_status"] if item["compare_status"] in {"same", "changed"} else "unavailable"
         for event in events:
             event.compare_status = item["compare_status"]
+        diffs.extend(events)
         item["findings"] = classify_findings(irs.get((q.query_id, "old")), irs.get((q.query_id, "new")),
                                              events, item["compare_status"])
+        if events:
+            item["change_summary"] = change_summary(item["findings"], events, pair[0][1], pair[1][1])
         item["assessment_evidence"] = detect(q, irs.get((q.query_id, "old")), irs.get((q.query_id, "new")),
             events, item["compare_status"], item["issues"], assessment_schema,
             {side: snapshots.get((q.query_id, side)) for side in ("old", "new")})
-        item["assessment"] = evaluate(item["assessment_evidence"],
-                                      (policy or {}).get("selected"), (policy or {}).get("thresholds"))
-        if item["assessment_evidence"]["mandatory_reviews"]:
+        item["assessment"] = evaluate(item["assessment_evidence"], selected_rules, thresholds)
+        if item["assessment"]["status"] == "review":
             item["requires_review"] = True
         items.append(item)
     counts = {status: sum(i["compare_status"] == status for i in items) for status in ("same", "changed", "incomparable", "not_run")}
@@ -328,7 +335,8 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, asses
                "events": len(diffs), "complete_comparison_rate": str(Decimal(full) / Decimal(selected)) if selected else None,
                "coverage_denominator": "selected_samples_including_unresolved", "business_coverage": "unknown"}
     findings = [f for item in items for f in item["findings"]]
-    summary.update(unavailable=counts["incomparable"] + counts["not_run"],
+    summary.update(text_equivalent=sum(bool(i.get("text_equivalence")) for i in items),
+                   unavailable=counts["incomparable"] + counts["not_run"],
                    confirmed_events=sum(e.compare_status == "changed" for e in diffs),
                    unconfirmed_events=sum(e.compare_status != "changed" for e in diffs),
                    plan_findings=sum(f["confirmed"] and f["kind"] == "plan" for f in findings),
@@ -337,12 +345,16 @@ def _summarize(queries, snapshots, fingerprint, issues, interrupted=False, asses
                              for key in ("better", "worse", "equivalent", "review", "excluded")}
     summary["data_review"] = {key: sum(i["compare_status"] == key and bool(i["assessment_evidence"]["mandatory_reviews"])
                                        for i in items) for key in ("same", "changed", "incomparable")}
-    basis = dict(plan_evaluation=0, model_only=0, missing_definition=0, unresolved_difference=0)
+    basis = dict(plan_evaluation=0, model_only=0, missing_definition=0, selected_runtime=0, unresolved_difference=0)
     for item in items:
         if item["assessment"]["status"] == "review":
-            ids = {r["rule_id"] for r in item["assessment_evidence"]["mandatory_reviews"]}
+            evidence = item["assessment_evidence"]
+            ids = {r["rule_id"] for r in evidence["mandatory_reviews"]}
             reason = ("plan_evaluation" if ids & {"D01", "D02"} else "missing_definition" if "D10" in ids
                       else "model_only" if "D08" in ids else "unresolved_difference")
+            if not ids and any(r["rule_id"] in (selected_rules or ()) for r in evidence["runtime_notes"]):
+                if evaluate({**evidence, "runtime_notes": []}, selected_rules, thresholds)["status"] != "review":
+                    reason = "selected_runtime"
             basis[reason] += 1
     summary["review_basis"] = basis
     status = "interrupted" if interrupted else "blocked" if not selected else "partial" if full != selected else "completed"
@@ -379,7 +391,7 @@ def _write_result(root, result, bundle, snapshots, irs, events, assessment_schem
         write_jsonl(root / f"plans/{side}.jsonl", (snapshots[q.query_id, side] for q in bundle.queries if (q.query_id, side) in snapshots))
         write_jsonl(root / f"ir/{side}.jsonl", [irs[q.query_id, side] for q in bundle.queries if (q.query_id, side) in irs])
     write_jsonl(root / "events.jsonl", events.rows)
-    render_reports(root, result, bundle.queries, snapshots, irs, bundle.selection, bundle.context)
+    result.report_file = render_reports(root, result, bundle.queries, snapshots, irs, bundle.selection, bundle.context).name
 
 
 def _bundle_business(bundle):
@@ -585,11 +597,19 @@ def compare(request: CompareRequest, *, profiles=None, on_event=None, cancel=Non
     # Assessment-only changes can reuse validated raw plans. v3 did not archive
     # the projection session variable. Configured policies have distinct inputs.
     compatible = ()
-    if request.resume and not request.warmup_only and VERSIONS["assessment_version"] == "7":
+    if request.resume and VERSIONS["assessment_version"] == "8":
+        previous = {**inputs, "versions": {**inputs["versions"], "assessment_version": "7"}}
+        if "assessment_policy" in previous:
+            old_policy = {**previous["assessment_policy"], "version": "7"}
+            old_policy["rules_fingerprint"] = digest({k: v for k, v in old_policy.items()
+                                                      if k not in {"actual_versions", "rules_fingerprint"}})
+            previous["assessment_policy"] = old_policy
+        compatible = (digest(previous),)
+    if request.resume and not request.warmup_only and VERSIONS["assessment_version"] == "8":
         legacy_targets = {s: {**info, "session": {k: v for k, v in info["session"].items()
                                                   if k != "tidb_opt_projection_push_down"}}
                           for s, info in inputs["targets"].items()}
-        compatible = tuple(digest({**inputs, "targets": targets, "versions": {**inputs["versions"], "assessment_version": version}})
+        compatible += tuple(digest({**inputs, "targets": targets, "versions": {**inputs["versions"], "assessment_version": version}})
                            for version, targets in (("6", inputs["targets"]), ("5", inputs["targets"]),
                                                     ("4", inputs["targets"]), ("3", legacy_targets)))
     events.emit("compare_started", fingerprint=fingerprint, format=common[0], targets=target_info)
@@ -667,6 +687,7 @@ def compare(request: CompareRequest, *, profiles=None, on_event=None, cancel=Non
         _write_result(root, result, bundle, snapshots, irs, events, assessment_schema)
         publication.checkpoint(run_status=result.run_status, completed=[list(k) for k in sorted(snapshots)])
         manifest = {"kind": "ComparisonResult", "versions": VERSIONS, "run_status": result.run_status,
+                    "report_file": result.report_file,
                     "business_fingerprint": digest(business_value({"items": result.items, "diffs": result.diffs})),
                     "targets": target_info, "created_at": now()}
         if not cancel.is_set():
@@ -696,10 +717,20 @@ def diff(request: DiffRequest, *, on_event=None, cancel=None) -> ComparisonResul
     assessment_schema = read_json(schema_path) if schema_path.exists() else {}
     # Older archives identify views but do not include their definitions.
     for obj in bundle.manifest.get("objects", []):
-        if obj.get("kind") == "view" and "view_reviews" not in assessment_schema.get(obj["schema"] + "." + obj["table"], {}):
-            assessment_schema[obj["schema"] + "." + obj["table"]] = dict(
+        if obj.get("kind") != "view":
+            continue
+        key = obj["schema"] + "." + obj["table"]
+        entry = assessment_schema.get(key, {})
+        if "view_reviews" not in entry:
+            assessment_schema[key] = dict(
                 view_dependencies=obj.get("dependencies", []),
                 view_reviews=[["D10", "归档缺少视图定义，无法排除内部读表求值。"]])
+        elif manifest.get("versions", {}).get("assessment_version") != VERSIONS["assessment_version"]:
+            # Comparison archives contain derived view evidence, not the defining SQL.
+            other_reviews = [r for r in entry["view_reviews"] if r[0] not in {"D02", "D03"}]
+            if not any(rule == "D10" for rule, _ in other_reviews):
+                other_reviews.append(["D10", "旧归档缺少视图定义，请用原采集包重新比较以核实列绑定及聚合。"])
+            entry["view_reviews"] = other_reviews
     from pcc_tool.plan.rule_config import load_policy
     rule_path = root / "assessment_rules.json"
     archived_rules = read_json(rule_path) if rule_path.exists() else {}
@@ -732,6 +763,7 @@ def diff(request: DiffRequest, *, on_event=None, cancel=None) -> ComparisonResul
         _write_result(publication.work, result, bundle, snapshots, irs, events, assessment_schema)
         publication.checkpoint(run_status=result.run_status)
         publication.publish({"kind": "ComparisonResult", "versions": VERSIONS, "run_status": result.run_status,
+                             "report_file": result.report_file,
                              "business_fingerprint": digest(business_value({"items": result.items, "diffs": result.diffs})),
                              "targets": manifest.get("targets", {}), "created_at": now()})
     return result

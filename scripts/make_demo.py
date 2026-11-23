@@ -28,7 +28,7 @@ def make_demo(out):
         api._write_result(publication.work, result, bundle, plans, irs, api.Events())
         publication.checkpoint()
         publication.publish({"kind": "ComparisonResult", "versions": VERSIONS, "run_status": result.run_status,
-                             "fixture_origin": "synthetic_demo_not_cluster_certification"})
+                             "fixture_origin": "synthetic_demo_not_cluster_certification", "report_file": result.report_file})
 
 
 if __name__ == "__main__":

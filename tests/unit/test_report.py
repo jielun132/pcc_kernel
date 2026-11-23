@@ -36,8 +36,8 @@ def make_report(tmp_path, snapshot, states):
                 snap.capture_status = 'failed'
             snapshots[q.query_id, side] = snap
     result, irs = api._summarize(queries, snapshots, 'test', [])
-    render_reports(tmp_path, result, queries, snapshots, irs, {}, {})
-    return (tmp_path / 'report.html').read_text(), result
+    path = render_reports(tmp_path, result, queries, snapshots, irs, {}, {})
+    return path.read_text(), result
 
 
 def test_report_has_three_exclusive_outcomes_and_defaults_to_all(tmp_path, snapshot):
@@ -78,8 +78,7 @@ def test_review_basis_tracks_raw_plans_even_when_automatic_result_is_unchanged(t
              for s in ('old', 'new')}
     def render():
         result, irs = api._summarize([q], plans, 'same-comparison-inputs', [])
-        render_reports(tmp_path, result, [q], plans, irs, {}, {})
-        text = (tmp_path / 'report.html').read_text()
+        text = render_reports(tmp_path, result, [q], plans, irs, {}, {}).read_text()
         record = json.loads(re.search(r'<script type="application/json" id="report-data">(.*?)</script>', text, re.S)[1])[0]
         return record['reviewBasis'], result.items[0]['assessment']
     first, original = render()
@@ -99,6 +98,18 @@ def test_all_same_remain_visible_and_only_empty_report_has_empty_state(tmp_path,
         empty = next(attrs for attrs in tags.attrs('div') if attrs.get('id') == 'empty')
         assert ('hidden' in empty) == bool(states)
         assert '没有符合当前筛选条件的 SQL' in text
+
+
+def test_repeated_renders_preserve_both_html_files_and_csv_summary(tmp_path, snapshot):
+    import csv
+    make_report(tmp_path, snapshot, ['changed'])
+    first, = tmp_path.glob('report-*.html')
+    original = first.read_bytes()
+    make_report(tmp_path, snapshot, ['same', 'changed'])
+    assert first.read_bytes() == original and len(list(tmp_path.glob('report-*.html'))) == 2
+    with (tmp_path / 'differences.csv').open(encoding='utf-8-sig', newline='') as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows[0]['change_summary'] == '' and 'rows:1 → rows:2' in rows[1]['change_summary']
 
 
 def test_changed_fields_are_marked_without_losing_text_or_escaping():

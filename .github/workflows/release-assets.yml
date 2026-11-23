@@ -36,7 +36,7 @@ jobs:
               env -i PATH=/usr/bin:/bin LANG=C.UTF-8 "$binary" diff \
                 --result-dir "$package_dir/examples/demo-result" --out /output/offline-smoke || code=$?
               test "$code" -eq 3
-              test -s /output/offline-smoke/report.html
+              test -s /output/offline-smoke/report-*.html
             '
       - name: Upload native package, SDK and source distribution
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

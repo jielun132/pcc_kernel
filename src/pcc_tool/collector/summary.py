@@ -1,14 +1,42 @@
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, localcontext
 
-from pcc_tool.capture.guard import SYSTEM_SCHEMAS, dependencies, guard_sql
+from sqlglot import exp
+from sqlglot.errors import SqlglotError
+
+from pcc_tool.capture.guard import SYSTEM_SCHEMAS, TiDBValidation, dependencies, guard_sql
 from pcc_tool.models import METRICS, PCCError, QueryCase, digest, primitive
 
 IDENTITY = ("source_cluster", "source_epoch", "instance", "summary_begin_time", "schema_name",
             "sql_digest", "plan_digest", "previous_statement_key")
+_SYSTEM_NAME = re.compile(r"\b(?:" + "|".join(sorted(SYSTEM_SCHEMAS)) + r")\b", re.I)
+_IDENTIFIER = r"(`(?:``|[^`])+`|[^`.,\s]+)"
+_QUALIFIED_NAME = re.compile(_IDENTIFIER + r"\s*\.\s*" + _IDENTIFIER)
+
+
+def _table_refs(names):
+    """TABLE_NAMES uses commas between references. Quoted identifiers can contain commas or dots."""
+    for entry in re.findall(r"(?:`(?:``|[^`])*`|[^`,])+|`", names or ""):
+        if entry.strip():
+            match = _QUALIFIED_NAME.fullmatch(entry.strip())
+            if match:
+                yield [s[1:-1].replace("``", "`") if s.startswith("`") else s for s in match.groups()]
+            else:
+                yield None
+
+
+def _system_reference(sql):
+    if not sql or not _SYSTEM_NAME.search(sql):
+        return False
+    try:
+        return any(table.db.lower() in SYSTEM_SCHEMAS for tree in TiDBValidation().parse(sql) if tree
+                   for table in tree.find_all(exp.Table))
+    except (SqlglotError, RecursionError):
+        return False
 
 
 def instant(value: str) -> datetime:
@@ -47,8 +75,8 @@ def merge_snapshots(rows: list[dict]) -> tuple[list[dict], list[dict]]:
                 r[field] = "unknown" if field == "source_epoch" else ""
         if not r.get("sql_digest") or r["schema_name"].lower() in SYSTEM_SCHEMAS:
             continue
-        names = r.get("table_names", "") or ""
-        if any(t.strip().split(".")[0].lower() in SYSTEM_SCHEMAS for t in names.split(",") if "." in t):
+        if (any(pair and pair[0].lower() in SYSTEM_SCHEMAS for pair in _table_refs(r.get("table_names")))
+                or any(_system_reference(r.get(field)) for field in ("query_sample_text", "digest_text", "sql_text"))):
             continue
         r.setdefault("source_epoch", "unknown")
         if r.get("counter_reappeared"):
@@ -87,6 +115,10 @@ def merge_snapshots(rows: list[dict]) -> tuple[list[dict], list[dict]]:
 
 def select_queries(rows: list[dict], *, begin: str, end: str, top_n=20, order_by=METRICS,
                    ranking_scope="global", schemas=(), statement_types=("select", "update", "delete")):
+    if "*" in schemas:
+        if tuple(schemas) != ("*",):
+            raise PCCError("INVALID_SELECTION", "采集全部业务库请单独指定 *")
+        schemas = ()
     start, stop = instant(begin), instant(end)
     if start >= stop or top_n <= 0 or ranking_scope not in {"global", "per_schema"}:
         raise PCCError("INVALID_SELECTION", "时间范围、Top N 或排名范围无效")
@@ -147,12 +179,8 @@ def select_queries(rows: list[dict], *, begin: str, end: str, top_n=20, order_by
             for sample in row["samples"]:
                 q = make_query(sample["sql"], schema, sample["origin"], sample["context"],
                                statement_types, bool(sample["truncated"]))
-                for table_ref in (row.get("table_names") or "").split(","):
-                    table_ref = table_ref.strip()
-                    if not table_ref:
-                        continue
-                    if table_ref.count(".") == 1:
-                        pair = table_ref.split(".", 1)
+                for pair in _table_refs(row.get("table_names")):
+                    if pair:
                         if pair not in q.dependencies:
                             q.dependencies.append(pair)
                     else:
@@ -173,6 +201,7 @@ def select_queries(rows: list[dict], *, begin: str, end: str, top_n=20, order_by
         raise PCCError("NO_QUERIES_SELECTED", "没有符合条件的 SQL")
     selection = {"begin": begin, "end": end, "window_semantics": "overlapping_cumulative_windows",
                  "top_n": top_n, "ranking_scope": ranking_scope, "schemas": schemas,
+                 "excluded_system_schemas": sorted(SYSTEM_SCHEMAS),
                  "statement_types": statement_types, "order_by": order_by,
                  "selected_digests": len(selected), "visible_digests": len(candidates),
                  "coverage": "visible_summary_only", "rankings": [

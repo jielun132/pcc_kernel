@@ -33,28 +33,69 @@ def _sources(scope, seen=None):
         yield from _sources(child, seen)
 
 
-def _has_column(scope, name, schema, metadata):
-    for _, source in scope.selected_sources.values():
+def _input_columns(schema, metadata):
+    """Resolve visible inputs once per source. '*' represents unavailable column evidence."""
+    exports = {}
+
+    def columns(source):
+        key = id(source)
+        if key in exports:
+            return exports[key]
+        exports[key] = {"*"}  # Recursive CTEs can refer back to their own output.
         if isinstance(source, exp.Table):
-            cols = metadata.get((source.db or schema) + "." + source.name, {}).get("columns", {})
+            names = metadata.get((source.db or schema) + "." + source.name, {}).get("columns") or ("*",)
+            result = {name.casefold() for name in names}
+        elif source.outer_columns:
+            result = {name.casefold() for name in source.outer_columns}
+        elif source.union_scopes:
+            result = columns(source.union_scopes[0])  # Set output names come from the left operand.
         else:
-            cols = source.outer_columns or source.expression.named_selects
-        if any(c.casefold() == name.casefold() for c in cols):
-            return True
-    return False
+            result = set()
+            for field in source.expression.selects:
+                if field.is_star:
+                    result.update(inputs(source, field.table if isinstance(field, exp.Column) else ""))
+                elif field.output_name:
+                    result.add(field.output_name.casefold())
+        exports[key] = result
+        return result
+
+    def inputs(scope, qualifier=""):
+        names = set()
+        for alias, (_, source) in scope.selected_sources.items():
+            if not qualifier or alias.casefold() == qualifier.casefold():
+                names.update(columns(source))
+        return names
+
+    return inputs
 
 
-def _correlated(scope, schema, metadata):
+def _local_column(col, scope, inputs):
+    if col.table:
+        return any(alias.casefold() == col.table.casefold() for alias in scope.selected_sources)
+    names = inputs(scope)
+    if col.name.casefold() in names:
+        return True
+    return None if "*" in names else False
+
+
+def _correlated(scope, scopes_by_query, inputs, ignored):
     for col in scope.external_columns:
-        if col.table:
-            return True
-        # sqlglot also lists unqualified *local* columns as external until bound.
-        if not _has_column(scope, col.name, schema, metadata):
-            parent = scope.parent
-            while parent:
-                if _has_column(parent, col.name, schema, metadata):
+        if id(col) in ignored:
+            continue
+        # sqlglot includes unbound local columns and references from nested query blocks.
+        current = scopes_by_query.get(id(col.find_ancestor(exp.Query)), scope)
+        inside = True
+        while current:
+            found = _local_column(col, current, inputs)
+            if found is None:
+                break  # Missing local DDL cannot prove an outer reference.
+            if found:
+                if not inside:
                     return True
-                parent = parent.parent
+                break
+            if current is scope:
+                inside = False
+            current = current.parent
     return False
 
 
@@ -94,7 +135,27 @@ def _join_may_multiply(scope, join, schema, metadata):
     return True
 
 
-def _subquery_risk(scope, schema, metadata):
+def _global_aggregate(scope, inputs):
+    query = scope.expression
+    if not isinstance(query, exp.Select) or query.args.get("group") or query.args.get("having"):
+        return False
+    # A fixed LIMIT/OFFSET can keep or drop the aggregate row independently of the data.
+    for clause in ("limit", "offset"):
+        bound = query.args.get(clause)
+        if bound and not (isinstance(bound.expression, exp.Literal) and bound.expression.is_int):
+            return False
+    for field in query.expressions:
+        for node in field.walk(prune=lambda n: isinstance(n, exp.Query)):
+            if not isinstance(node, exp.AggFunc) or isinstance(node.parent, exp.Window) or node.find(exp.Query):
+                continue
+            # An aggregate whose arguments refer only to outer columns can belong to the outer block.
+            columns = list(node.find_all(exp.Column))
+            if not columns or any(_local_column(c, scope, inputs) for c in columns):
+                return True
+    return False
+
+
+def _subquery_risk(scope, scopes_by_query, inputs):
     query = scope.expression
     wrapper = query.parent
     while isinstance(wrapper, (exp.Paren, exp.Subquery)):
@@ -106,12 +167,16 @@ def _subquery_risk(scope, schema, metadata):
         return None
     source = "内层读取 " + "、".join(tables) + "。"
     projection = query.expressions[0].unalias() if query.expressions else None
-    global_agg = isinstance(projection, exp.AggFunc) and not any(
-        query.args.get(key) for key in ("group", "having", "offset", "limit"))
-    if isinstance(wrapper, exp.Exists) and global_agg:
-        return None  # A global aggregate emits one row even on an empty input.
+    ignored = set()
+    if isinstance(wrapper, exp.Exists):
+        if _global_aggregate(scope, inputs):
+            return
+        if isinstance(query, exp.Select) and not (query.args.get("group") or query.args.get("having")):
+            # EXISTS discards the projected values. Outer columns used only there
+            # do not make the presence of an input row depend on the current key.
+            ignored = {id(c) for field in query.expressions for c in field.find_all(exp.Column)}
     is_set = isinstance(wrapper, (exp.In, exp.Any, exp.All))
-    correlated = _correlated(scope, schema, metadata)
+    correlated = _correlated(scope, scopes_by_query, inputs, ignored)
     if is_set:
         op = wrapper.key.upper()
         if isinstance(wrapper.parent, exp.Not):
@@ -123,15 +188,29 @@ def _subquery_risk(scope, schema, metadata):
         negated = isinstance(wrapper.parent, exp.Not)
         yield "D02", source + ("NOT EXISTS 在空集为真" if negated else "EXISTS 在空集为假") + "。TiDB 可能在优化时求值，存在匹配行时外层分支可能改变。"
     elif not is_set:
-        if global_agg and isinstance(projection, exp.Count):
+        unbounded = not any(query.args.get(k) for k in ("group", "having", "limit", "offset"))
+        if unbounded and isinstance(projection, exp.Count):
             effect = "无分组 COUNT 在空集为 0，实际计数可改变点查键、范围或输出常量。"
-        elif global_agg and isinstance(projection, (exp.Min, exp.Max, exp.Sum, exp.Avg)):
+        elif unbounded and isinstance(projection, (exp.Min, exp.Max, exp.Sum, exp.Avg)):
             effect = projection.key.upper() + " 在空集为 NULL，有匹配行时可得到具体值，导致谓词或访问范围改变。"
         elif query.args.get("limit") and isinstance(query.args["limit"].expression, exp.Literal) and query.args["limit"].expression.this == "1":
             effect = "LIMIT 1 在空集得不到行，有数据时所取的值可能改变外层的范围或投影。"
         else:
             effect = "零行可产生 NULL，单行的值依赖样本。若允许返回多行，真实数据还可能触发错误 1242。"
         yield "D01", source + "读表标量子查询在可独立求值时可能被折叠。" + effect
+
+
+def _read_scopes(tree):
+    if not isinstance(tree, (exp.Update, exp.Delete)):
+        return traverse_scope(tree)
+    # SQLGlot traverses each DML subquery as a root. Give its expressions the
+    # actual outer tables/CTEs so ordinary SELECT name binding also works here.
+    write = tree.copy()
+    sources = write.args.get("using") or [write.this]
+    outer = exp.Select(expressions=write.expressions, from_=exp.From(this=sources[0]),
+                       joins=[exp.Join(this=table) for table in sources[1:]],
+                       **{k: write.args[k] for k in ("with_", "where", "order", "limit") if write.args.get(k)})
+    return traverse_scope(outer)[:-1]  # The enclosing write has its own D11/D05 rules.
 
 
 def sql_risks(tree, schema, metadata, kind=None):
@@ -150,8 +229,11 @@ def sql_risks(tree, schema, metadata, kind=None):
     if isinstance(tree, (exp.Update, exp.Delete)) and tree.args.get("limit") and (
             tree.args.get("where") or tree.args.get("order")) and not _literal_zero_limit(tree):
         risks.append(("D05", "写语句按条件或顺序选取有限行。实际定位到足够候选行所需的扫描量未知。"))
-    for scope in traverse_scope(tree):
-        risks.extend(_subquery_risk(scope, schema, metadata))
+    scopes = _read_scopes(tree)
+    scopes_by_query = {id(scope.expression): scope for scope in scopes}
+    inputs = _input_columns(schema, metadata)
+    for scope in scopes:
+        risks.extend(_subquery_risk(scope, scopes_by_query, inputs))
         select = scope.expression
         if isinstance(select, exp.SetOperation) and (not isinstance(select, exp.Union) or select.args.get("distinct")) and any(_sources(scope)):
             risks.append(("D04", select.key.upper() + " 的输入集合重叠率和重复度会改变合并、筛除及去重规模。"))
