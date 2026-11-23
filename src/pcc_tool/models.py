@@ -13,7 +13,7 @@ from typing import Any
 CONTRACT_VERSION = "1"
 DEFAULT_CONCURRENCY = 8
 VERSIONS = dict(contract_version="1", ir_version="1", normalizer_version="2",
-                matcher_version="3", diff_version="2", guard_version="3", materials_version="1", rules_version="1", assessment_version="7")
+                matcher_version="3", diff_version="2", guard_version="3", materials_version="1", rules_version="1", assessment_version="8")
 METRICS = ("execution_count", "total_latency", "average_latency", "total_keys", "average_keys")
 
 
@@ -194,6 +194,11 @@ class ComparisonResult:
     run_status: str
     output_dir: str = ""
     assessment_policy: dict = field(default_factory=dict)
+    report_file: str = ""
+
+    @property
+    def report_path(self) -> str:
+        return str(Path(self.output_dir) / self.report_file) if self.report_file else ""
 
     @property
     def exit_code(self) -> int:

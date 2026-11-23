@@ -44,6 +44,8 @@ def test_exact_pair_auto_selection_and_custom_fallback(tmp_path):
 @pytest.mark.parametrize("raw", [
     [], {"schema_version": True}, {"schema_version": 1.0}, {"schema_version": 2}, {"typo": 1},
     {"selected": ["BAD"]}, {"selected": ["E01", "E01"]}, {"selected": "E01"},
+    {"text_equivalence_rules": "projection_alias"}, {"text_equivalence_rules": ["unknown"]},
+    {"profiles": [{"id": "default", "text_equivalence_rules": ["projection_alias", "projection_alias"]}]},
     {"thresholds": {"min_rows": True}}, {"thresholds": {"max_ratio_pct": 51}},
     {"thresholds": {"min_rows": "1e9"}}, {"thresholds": {"unknown": 1}},
     {"cards": {"E01": {"automatic": True}}}, {"cards": {"D01": {"default": False}}},

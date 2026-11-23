@@ -33,7 +33,8 @@ def main():
     with Publication(args.out, digest({"count": args.count, "versions": VERSIONS})) as publication:
         api._write_result(publication.work, result, bundle, snapshots, irs, api.Events())
         publication.checkpoint()
-        publication.publish({"kind": "ComparisonResult", "versions": VERSIONS, "run_status": result.run_status})
+        publication.publish({"kind": "ComparisonResult", "versions": VERSIONS, "run_status": result.run_status,
+                             "report_file": result.report_file})
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     info = {"count": args.count, "distinct_sql_hashes": len({q.sql_hash for q in queries}),
             "compute_seconds": round(compute, 4), "total_seconds": round(time.perf_counter() - start, 4),

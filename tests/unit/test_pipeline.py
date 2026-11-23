@@ -50,6 +50,32 @@ def test_online_to_offline_equal(tmp_path, online):
     assert offline.summary == result.summary and offline.diffs == result.diffs
 
 
+def test_text_policy_replays_from_raw_plans_and_reports_have_distinct_paths(tmp_path, online, monkeypatch):
+    import re
+    from pathlib import Path
+    bundle, profiles, _, capture = online
+    def alias_plan(q, side, profile, **kwargs):
+        plan = capture(q, side, profile, **kwargs)
+        plan.rows = [["Projection_1", "1", "root", "", "app.t.id" if side == "old" else "app.t.id->Column#3"]]
+        return plan
+    monkeypatch.setattr(api, "capture_plan", alias_plan)
+    rules = tmp_path / "rules.json"
+    rules.write_text(json.dumps({"profiles": [{"id":"default", "text_equivalence_rules":["projection_alias"]}]}))
+    result = api.compare(CompareRequest(bundle.path, "old", "new", str(tmp_path / "online"), rules_config=str(rules)), profiles=profiles)
+    rules.write_text('{"text_equivalence_rules":[]}')
+    inherited = api.diff(DiffRequest(result.output_dir, str(tmp_path / "inherited")))
+    strict = api.diff(DiffRequest(result.output_dir, str(tmp_path / "strict"), rules_config=str(rules)))
+    assert result.items == inherited.items and result.exit_code == inherited.exit_code == 0
+    assert inherited.summary["text_equivalent"] == "4" and strict.exit_code == 1 and strict.summary["changed"] == "4"
+    assert all("Projection" in i["change_summary"] and "Column#3" in i["change_summary"] for i in strict.items)
+    assert len({r.report_file for r in (result, strict, inherited)}) == 3
+    for r in (result, strict, inherited):
+        manifest = verify(Path(r.output_dir), "ComparisonResult")
+        assert re.fullmatch(r"report-\d{8}-\d{6}-\d{6}Z-[a-f0-9]{6}\.html", r.report_file)
+        assert manifest["report_file"] == r.report_file and r.report_file in manifest["files"]
+        assert Path(r.report_path).is_file() and not (Path(r.output_dir) / "report.html").exists()
+
+
 def test_warmup_only_archives_first_observation_and_formal_recaptures(tmp_path, online, monkeypatch):
     bundle, profiles, calls, capture = online
     attempts = {}
@@ -69,7 +95,7 @@ def test_warmup_only_archives_first_observation_and_formal_recaptures(tmp_path, 
         result = api.compare(CompareRequest(bundle.path, "old", "new", str(warmup), warmup_only=True, stats_retries=5), profiles=profiles)
     assert verify(warmup, "PlanWarmup")["run_status"] == "completed"
     assert result.summary["full_comparisons"] == "0" and not result.items and not result.diffs
-    assert not (warmup / "report.html").exists() and set(attempts.values()) == {1}
+    assert not list(warmup.glob("*.html")) and set(attempts.values()) == {1}
     formal = api.compare(CompareRequest(bundle.path, "old", "new", str(tmp_path / "formal")), profiles=profiles)
     assert formal.summary["same"] == "4" and formal.exit_code == 0 and set(attempts.values()) == {2}
     with pytest.raises(PCCError):
@@ -88,7 +114,7 @@ def test_warmup_resumes_without_reusing_first_observation_as_formal(tmp_path, on
     assert first.run_status == "interrupted" and not (tmp_path / "warmup").exists()
     second = api.compare(replace(request, resume=True), profiles=profiles)
     assert second.run_status == "completed" and len(calls) == len(set(calls)) == 8
-    assert not (tmp_path / "warmup/report.html").exists()
+    assert not list((tmp_path / "warmup").glob("*.html"))
 
 
 def test_external_rule_policy_is_archived_and_inherited_offline(tmp_path, online):
@@ -177,7 +203,7 @@ def test_partial_failures_and_repeated_material_checks_replay_identically(tmp_pa
         assert {i["code"] for i in item["issues"]} == {"STATS_NOT_READY","DB_QUERY_FAILED"}
 
 
-@pytest.mark.parametrize("prior_assessment", ["3", "4", "5", "6"])
+@pytest.mark.parametrize("prior_assessment", ["3", "4", "5", "6", "7"])
 @pytest.mark.parametrize("resumed_concurrency", [1, 8])
 def test_interrupt_and_resume(tmp_path, monkeypatch, online, prior_assessment, resumed_concurrency):
     bundle, profiles, calls, capture = online
@@ -209,6 +235,27 @@ def test_resume_rejects_version_drift(tmp_path, online):
     with pytest.raises(PCCError) as err:
         api.compare(CompareRequest(bundle.path, "old", "new", output, resume=True), profiles=profiles)
     assert err.value.code == "RESUME_MISMATCH"
+
+
+@pytest.mark.parametrize("warmup", [False, True])
+def test_v7_checkpoints_resume_with_the_same_configured_rules(tmp_path, online, monkeypatch, warmup):
+    from dataclasses import replace
+    from pcc_tool.plan import rule_config
+    bundle, profiles, calls, _ = online
+    config = tmp_path / "runtime.json"
+    config.write_text('{"selected":["D12"]}')
+    req = CompareRequest(bundle.path, "old", "new", str(tmp_path / "capture"), concurrency=1,
+                         warmup_only=warmup, rules_config=str(config))
+    stop = threading.Event()
+    def interrupt(event):
+        if event["event"] == "plan_captured":
+            stop.set()
+    with monkeypatch.context() as previous:
+        previous.setattr(api, "VERSIONS", {**api.VERSIONS, "assessment_version": "7"})
+        previous.setattr(rule_config, "ASSESSMENT_VERSION", "7")
+        assert api.compare(req, profiles=profiles, on_event=interrupt, cancel=stop).run_status == "interrupted"
+    resumed = api.compare(replace(req, resume=True), profiles=profiles)
+    assert resumed.run_status == "completed" and len(calls) == len(set(calls)) == 8
 
 
 def test_resume_recaptures_legacy_partial_statistics(tmp_path, monkeypatch, online):

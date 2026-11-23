@@ -107,7 +107,7 @@ def simple_predicates(text):
         parts = split_list(text[4:-1])
     normalized = []
     for part in parts:
-        match = re.fullmatch(r"(eq|ne|lt|le|gt|ge)\((-?\d+),\s*(-?\d+)\)", part)
+        match = re.fullmatch(r"(eq|ne|lt|le|gt|ge)\((-?[0-9]{1,65}),\s*(-?[0-9]{1,65})\)", part)
         if not match:
             return None
         op, left, right = match.groups()

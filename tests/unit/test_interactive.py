@@ -232,7 +232,7 @@ def test_password_refuses_echoing_terminal(config, monkeypatch):
     assert "PCC_DB_PASSWORD" not in os.environ
 
 
-@pytest.mark.parametrize("configured,answer,expected", [(["demo"], "", ["demo"]), (["demo"], "*", []),
+@pytest.mark.parametrize("configured,answer,expected", [(["demo"], "", []), (["demo"], "*", []),
                                                        ([], "", []), (["demo"], "one, two", ["one", "two"])])
 def test_summary_schema_default_and_explicit_all(config, monkeypatch, configured, answer, expected):
     menu = interactive.Menu(config)
@@ -246,7 +246,7 @@ def test_summary_schema_default_and_explicit_all(config, monkeypatch, configured
     assert read_json(Path(menu.state["task"]) / "task.json")["options"]["schemas"] == expected
     assert "留空为全部" not in prompts[-1] and "*" in prompts[-1]
     if configured:
-        assert "回车用默认" in prompts[-1] and "[demo]" in prompts[-1]
+        assert "回车或 * 采集全部业务库" in prompts[-1] and "demo" in prompts[-1] and "[*]" in prompts[-1]
 
 
 def test_summary_rejects_mixed_wildcard_before_login(config, monkeypatch):
@@ -257,6 +257,18 @@ def test_summary_rejects_mixed_wildcard_before_login(config, monkeypatch):
     with pytest.raises(PCCError) as exc:
         menu.start(True)
     assert exc.value.code == "INVALID_CONFIG"
+
+
+def test_list_reports_includes_timestamped_online_offline_and_legacy(config, capsys):
+    menu = interactive.Menu(config)
+    reports = ["task-old/report-old/report.html", "task-new/report-new/report-20261123-090000.html",
+               "offline-run/report-20261123-091500.html"]
+    for name in reports:
+        path = menu.root / name
+        path.parent.mkdir(parents=True)
+        path.write_text(name)
+    menu.reports()
+    assert set(capsys.readouterr().out.splitlines()) == {str(menu.root / name) for name in reports}
 
 
 def fake_databases(monkeypatch, *, existing=(), shared=False):
@@ -463,7 +475,7 @@ def test_material_warmup_resumes_and_runs_only_once(config, material_bundle, tmp
         if out.name == "warmup":
             write_json(out / "summary.json", {"selected_samples": "1"})
             finalize(out, {"kind": "ComparisonResult"})
-        return SimpleNamespace(summary={}, run_status="ok", exit_code=0)
+        return SimpleNamespace(summary={}, run_status="ok", exit_code=0, report_path=str(out / "report-test.html"))
     monkeypatch.setattr(menu, "core", collect)
     menu.continue_task()
     assert "report" not in read_json(task / "task.json")
@@ -554,7 +566,7 @@ def test_import_both_then_compare_later_without_reimport(config, material_bundle
     calls = []
     def compare(function, request, **kwargs):
         calls.append((function, request.warmup_only, request.stats_retries))
-        return SimpleNamespace(summary={}, exit_code=0, run_status="completed")
+        return SimpleNamespace(summary={}, exit_code=0, run_status="completed", report_path=str(Path(request.out) / "report-test.html"))
     monkeypatch.setattr(restarted, "core", compare)
     restarted.continue_task()
     assert calls == [(api.compare, True, 0), (api.compare, False, 5)] and imported == ["old", "new"]

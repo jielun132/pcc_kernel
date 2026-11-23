@@ -1,6 +1,8 @@
 """Versioned, offline rule cards. A card is not evidence that its premise holds."""
 
-ASSESSMENT_VERSION = "7"
+from pcc_tool.models import VERSIONS
+
+ASSESSMENT_VERSION = VERSIONS["assessment_version"]
 DEFAULT_THRESHOLDS = {"min_rows": "1000", "max_ratio_pct": "10", "reduction_pct": "50", "estimate_pct": "10"}
 REQUIRED_DATA_RULES = {"D01", "D02", "D08", "D10"}
 

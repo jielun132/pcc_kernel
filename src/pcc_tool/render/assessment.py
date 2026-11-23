@@ -3,7 +3,8 @@ import html
 import json
 
 from pcc_tool.plan.rule_config import load_policy
-from pcc_tool.render.review import REVIEW_SCRIPT, REVIEW_STYLES
+from pcc_tool.render.rationale import RATIONALE_SCRIPT
+from pcc_tool.render.review import REVIEW_OVERVIEW, REVIEW_SCRIPT, REVIEW_STYLES
 
 
 def assessment_markup(fingerprint, policy=None):
@@ -30,7 +31,7 @@ def assessment_markup(fingerprint, policy=None):
     profiles = ''.join(f'<option value="{html.escape(p["id"], quote=True)}"'
                        + (' selected' if p["id"] == config["profile_id"] else '')
                        + f'>{html.escape(p["label"])}</option>' for p in config["profiles"])
-    markup = '''<section class="assessment-panel" id="assessment-panel" aria-label="规则预判">
+    markup = REVIEW_OVERVIEW + '''<section class="assessment-panel" id="assessment-panel" aria-label="规则预判">
 <div class="assessment-heading"><div><p class="eyebrow">RULE ASSESSMENT</p><h2>按规则预判计划变化</h2>
 <p>先判断普通 EXPLAIN 是否代表有数据时的计划，再判断计划差异。命中率、循环和内存等运行时信息列在每条 SQL 的详情中。</p></div>
 <button type="button" id="run-assessment" class="assessment-primary">按所选规则重新判断</button></div>
@@ -49,9 +50,6 @@ def assessment_markup(fingerprint, policy=None):
 <p class="rule-explanation">A12 另外要求至少 10000 行；E05 默认不勾选。E11 单独识别已核验的版本估算下限。组合证明需同时勾选其全部规则。阈值是本项目策略，不是 TiDB 官方性能保证。</p>
 </details><div class="assessment-exports"><span>当前结果可独立保存，含规则、阈值、证据和报告指纹。</span>
 <button type="button" id="export-assessment-json">导出判断 JSON</button><button type="button" id="export-assessment-csv">导出判断 CSV</button></div>
-<div class="review-tools"><label>人工评审筛选 <select id="review-filter"><option value="">全部</option><option value="pending">未完成评审</option><option value="reviewed">已评审</option><option value="stale">需重新确认</option></select></label>
-<button type="button" id="save-reviews">保存评审 JSON</button><label>恢复评审 <input type="file" id="import-reviews" accept=".json,application/json"></label>
-<p id="review-state" role="status" aria-live="polite"></p></div>
 </section><script type="application/json" id="assessment-config">''' + payload + '</script>'
     for key, default in (("min_rows", "1000"), ("max_ratio_pct", "10"), ("reduction_pct", "50"), ("estimate_pct", "10")):
         markup = markup.replace(f'id="threshold-{key}" value="{default}"', f'id="threshold-{key}" value="{config["thresholds"][key]}"')
@@ -90,6 +88,7 @@ const PCCAssessment=(()=>{
   function reviewCards(e,selected){
     return [...(e.mandatory_reviews||[]),...(e.runtime_notes||[]).filter(r=>selected.includes(r.rule_id))];
   }
+''' + RATIONALE_SCRIPT + r'''
   function evaluate(e,selected,thresholds){
     const mandatory=reviewCards(e,selected).map(r=>r.rule_id+' · '+r.reason);
     if(e.scope!=='changed'&&mandatory.length)return {status:'review',matched:[],uncovered:[],reasons:[...mandatory,...e.blockers]};
@@ -103,18 +102,18 @@ const PCCAssessment=(()=>{
     if(directions.size>1)reasons.push('同时命中变优和变差，不抵消');
     return {status:reasons.length||!matched.length?'review':directions.size?[...directions][0]:'equivalent',matched:matched.map(m=>m.id),uncovered,reasons};
   }
-  function csvCell(value){let s=String(value??'');if(/^[\s]*[=+@-]|^[\t\r\n]/.test(s))s="'"+s;return '"'+s.replaceAll('"','""')+'"';}
   function csv(payload){
-    const header=['query_id','sql_number','schema','compare_status','assessment','matched_rules','reasons','uncovered_event_refs','selected_rules','thresholds','assessment_version','rules_fingerprint','report_fingerprint','mandatory_rules','review_steps','runtime_notes','rule_profile','reviewed','needs_reconfirmation','human_conclusion','review_note'];
+    const header=['query_id','sql_number','schema','compare_status','assessment','matched_rules','reasons','uncovered_event_refs','selected_rules','thresholds','assessment_version','rules_fingerprint','report_fingerprint','mandatory_rules','review_steps','runtime_notes','rule_profile','reviewed','needs_reconfirmation','human_conclusion','review_note','change_summary','text_equivalence_rules','review_group','source_query_id','decision_summary','review_check'];
     const rows=payload.results.map(r=>[r.query_id,r.number,r.schema,r.compare_status,r.result.status,
       r.evidence.matches.filter(m=>r.result.matched.includes(m.id)).map(m=>m.rule_id).join(','),r.result.reasons.join('；'),r.result.uncovered.join(','),
       payload.selected.join(','),JSON.stringify(payload.thresholds),payload.version,payload.rules_fingerprint,payload.report_fingerprint,
       (r.evidence.mandatory_reviews||[]).map(m=>m.rule_id).join(','),reviewCards(r.evidence,payload.selected).map(m=>m.check).join(' / '),
       (r.evidence.runtime_notes||[]).map(m=>m.rule_id+' · '+m.reason+' '+m.check).join(' / '),payload.profile_id,
-      r.manual_review?.reviewed,r.manual_review?.needs_reconfirmation,r.manual_review?.conclusion,r.manual_review?.note]);
-    return '\uFEFF'+[header,...rows].map(row=>row.map(csvCell).join(',')).join('\r\n');
+      r.manual_review?.reviewed,r.manual_review?.needs_reconfirmation,r.manual_review?.conclusion,r.manual_review?.note,
+      r.change_summary,(r.text_equivalence_rules||[]).join(','),r.review_group,r.manual_review?.source_query_id,r.decision_summary,r.review_check]);
+    return reportCsv([header,...rows]);
   }
-  function attach(records,refresh){
+  function attach(records,refresh,currentScope){
     const node=document.getElementById('assessment-config');if(!node)return null;
     const config=JSON.parse(node.textContent),rules=new Map(config.rules.map(r=>[r.id,r]));
     const checks=Array.from(document.querySelectorAll('[data-rule-id]'));
@@ -125,6 +124,21 @@ const PCCAssessment=(()=>{
     const profiles=new Map((config.profiles||[]).map(p=>[p.id,p]));
     let profileId=config.profile_id,selected=[...config.selected],thresholds={...config.thresholds},filter=null,dirty=false,review=null;
     let results=new Map(records.map(r=>[r.id,r.assessment||evaluate(r.assessmentEvidence,selected,thresholds)]));
+    function reviewGroups(){
+      const members=new Map(),groups=new Map();
+      for(const r of records){
+        const e=r.assessmentEvidence,result=results.get(r.id);
+        if(!r.reviewPattern||r.status!=='changed'||e.blockers.length||reviewCards(e,selected).length)continue;
+        const proofs=e.matches.filter(m=>result.matched.includes(m.id)).map(m=>[m.rule_id,m.direction,m.requires_rules||[],m.event_refs]);
+        const uncovered=result.uncovered.map(ref=>[ref,r.eventKeys[Number(ref)-1]]);
+        const key=JSON.stringify([r.reviewPattern,result.status,proofs,uncovered]);
+        if(!members.has(key))members.set(key,[]);members.get(key).push(r);
+      }
+      for(const rows of members.values())if(rows.length>1)for(const r of rows)groups.set(r.id,String(rows[0].number));
+      return groups;
+    }
+    let groups=reviewGroups();
+    const groupId=r=>groups.get(r.id)||'';
     const scope=()=>[...results.values()].filter(r=>r.status!=='excluded').length;
     const mandatory=records.filter(r=>r.assessmentEvidence.mandatory_reviews?.length);
     function el(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;}
@@ -156,22 +170,45 @@ const PCCAssessment=(()=>{
     }));
     document.getElementById('run-assessment').addEventListener('click',()=>{
       const c=current();if(!valid(c.thresholds)){state.textContent='阈值需为界面标注范围内的整数；当前结果未变。';return;}
-      profileId=c.profile_id;selected=c.selected;thresholds=c.thresholds;results=new Map(records.map(r=>[r.id,evaluate(r.assessmentEvidence,selected,thresholds)]));dirty=false;message();refresh();
+      profileId=c.profile_id;selected=c.selected;thresholds=c.thresholds;results=new Map(records.map(r=>[r.id,evaluate(r.assessmentEvidence,selected,thresholds)]));groups=reviewGroups();dirty=false;message();refresh();
     });
     counts.addEventListener('click',event=>{const b=event.target.closest('[data-assessment-filter]');if(!b)return;filter=b.dataset.assessmentFilter;renderCounts();refresh(true);});
+    const explain=r=>decisionSummary(r,results.get(r.id),selected,thresholds);
     function payload(){return {version:config.version,rules_fingerprint:config.rules_fingerprint,report_fingerprint:config.report_fingerprint,
-      profile_id:profileId,actual_versions:config.actual_versions,manual_reviews:review?.payload(),
+      profile_id:profileId,actual_versions:config.actual_versions,manual_reviews:review?.payload(),manual_review_summary:review.summary(),
       selected:[...selected],thresholds:{...thresholds},scope:'changed_or_required_or_selected_runtime_review',claim:'rule_prediction_not_measured_performance',
-      results:records.map(r=>({query_id:r.queryId,number:r.number,schema:r.schema,compare_status:r.status,result:results.get(r.id),evidence:r.assessmentEvidence,manual_review:review?.state(r)}))};}
-    function download(kind){if(dirty)return;const data=payload(),blob=new Blob([kind==='json'?JSON.stringify(data,null,2):csv(data)],{type:kind==='json'?'application/json;charset=utf-8':'text/csv;charset=utf-8'});
-      const url=URL.createObjectURL(blob),a=el('a');a.href=url;a.download='pcc-assessments.'+kind;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+      text_equivalence_rules:config.text_equivalence_rules||[],text_equivalence_profile:config.profile_id,
+      text_estimate_pct:config.thresholds.estimate_pct,
+      results:records.map(r=>{const result=results.get(r.id),summary=explain(r);
+        return {query_id:r.queryId,number:r.number,schema:r.schema,compare_status:r.status,result,evidence:r.assessmentEvidence,
+          change_summary:r.changeSummary,decision_summary:summary.reason,review_check:summary.check,text_equivalence_rules:r.textRules||[],review_group:groupId(r),manual_review:review.state(r)};})};}
+    function download(kind){if(dirty)return;const data=payload();
+      downloadReportFile('pcc-assessments.'+kind,kind==='json'?'application/json;charset=utf-8':'text/csv;charset=utf-8',kind==='json'?JSON.stringify(data,null,2):csv(data));}
     exports.forEach((b,i)=>b.addEventListener('click',()=>download(i===0?'json':'csv')));
     function detail(record){
       if(!record)return;const host=document.getElementById(record.id)?.querySelector('.query-assessment');if(!host)return;host.replaceChildren();
-      const result=results.get(record.id),e=record.assessmentEvidence;host.className='query-assessment'+(result.status==='excluded'?'':' assessment-'+result.status);
-      if(result.status==='excluded')host.append(el('p',record.status==='same'?'原始计划一致。此项没有需要复核的计划差异。':'无法完整比较，请查看采集状态和问题记录。'));
-      else host.append(el('h3','规则预判 · '+labels[result.status]));
-      review?.detail(record,host);
+      const result=results.get(record.id),e=record.assessmentEvidence;
+      const title=el('h3',undefined,'review-verdict'),rule=el('p',undefined,'rule-verdict');
+      host.append(title,rule);
+      function showVerdict(s){
+        const manual=s.reviewed||s.needs_reconfirmation;
+        title.textContent=manual?review.caption(s):'规则预判 · '+labels[result.status];
+        title.hidden=!manual&&result.status==='excluded';
+        rule.hidden=!manual||result.status==='excluded';rule.textContent=rule.hidden?'':'规则预判 · '+labels[result.status];
+        const color=s.needs_reconfirmation?'review':s.reviewed?({accepted:'equivalent',review:'review'}[s.conclusion]||s.conclusion):result.status;
+        host.className='query-assessment'+(color==='excluded'?'':' assessment-'+color);
+      }
+      if(result.status==='excluded')host.append(el('p',record.status==='same'?(record.textRules?.length?'该项按已启用的文本规则计入一致。':'执行计划一致。'):'无法完整比较，请查看采集状态和问题记录。'));
+      else{
+        const summary=explain(record),box=el('section',undefined,'decision-summary');
+        box.setAttribute('aria-label','DBA 评审摘要');
+        function line(label,text){if(text){const p=el('p');p.append(el('b',label),el('span',text));box.append(p);}}
+        line('判断依据',summary.reason);line('建议核实',summary.check);line('变化摘要',record.changeSummary);
+        host.append(box);
+      }
+      if(record.textRules?.length&&result.status==='excluded'){
+        const optional=el('details');optional.append(el('summary','按需记录人工评审'));host.append(optional);review.detail(record,optional,showVerdict);
+      }else review.detail(record,host,showVerdict);
       if(e.runtime_notes?.length){
         const box=el('details',undefined,'assessment-evidence');box.append(el('summary','运行时提示 · '+e.runtime_notes.length+' 项'));
         e.runtime_notes.forEach(r=>{box.append(el('p',r.rule_id+' · '+rules.get(r.rule_id).title+' · '+(selected.includes(r.rule_id)?'已选入复核':'仅供实测参考')),
@@ -179,7 +216,10 @@ const PCCAssessment=(()=>{
       }
       if(result.status==='excluded')return;
       if(dirty)host.append(el('p','显示上次规则的结果，修改尚未应用。','assessment-stale'));
-      result.reasons.forEach(reason=>host.append(el('p',reason)));
+      if(result.reasons.length){
+        const reasons=el('details');reasons.append(el('summary','查看全部复核原因'));
+        result.reasons.forEach(reason=>reasons.append(el('p',reason)));host.append(reasons);
+      }
       (e.cautions||[]).forEach(c=>host.append(el('p',c,'assessment-hint')));
       (e.mandatory_reviews||[]).forEach(r=>{const box=el('p',r.rule_id+' 复核方法 · '+r.check+' ');const link=el('a','TiDB 依据 ↗');link.href=rules.get(r.rule_id).source;link.target='_blank';link.rel='noopener noreferrer';box.append(link);host.append(box);});
       const matched=e.matches.filter(m=>result.matched.includes(m.id));
@@ -195,10 +235,19 @@ const PCCAssessment=(()=>{
       if(result.uncovered.length){const box=el('details');box.append(el('summary',`未覆盖差异 · ${result.uncovered.length} 条`));result.uncovered.forEach(ref=>{const a=el('a','差异 '+ref);a.href='#'+record.id+'-diff-'+ref;box.append(a);});host.append(box);}
       const hints=e.hints.filter(h=>selected.includes(h.rule_id));if(hints.length){const box=el('details');box.append(el('summary','复核依据与缺少的证明'));const list=el('ul');hints.forEach(h=>list.append(el('li',h.rule_id+' · '+rules.get(h.rule_id).title+'：'+h.reason)));box.append(list);host.append(box);}
     }
-    review=PCCReview.attach(records,config,r=>JSON.stringify({evidence:r.reviewBasis,rules:config.rules_fingerprint,profile:profileId,selected:[...selected].sort(),thresholds:Object.fromEntries(Object.entries(thresholds).sort()),result:results.get(r.id)}),()=>dirty,refresh);
-    message();return {matches:r=>review.matches(r)&&(filter===null||(filter===''?results.get(r.id)?.status!=='excluded':results.get(r.id)?.status===filter)),label:r=>dirty?'预判待更新':labels[results.get(r.id)?.status],
-      status:r=>results.get(r.id)?.status,clearFilter:()=>{filter=null;review.clearFilter();renderCounts();},detail,payload,isDirty:()=>dirty};
+    function reviewBasis(r){
+      // Keep the v1 review format identical for live results and key-sorted archive JSON.
+      const {status,matched,uncovered,reasons}=results.get(r.id);
+      return JSON.stringify({evidence:r.reviewBasis,rules:config.rules_fingerprint,profile:profileId,selected:[...selected].sort(),
+        thresholds:Object.fromEntries(Object.entries(thresholds).sort()),result:{status,matched,uncovered,reasons}});
+    }
+    review=PCCReview.attach(records,config,reviewBasis,()=>dirty,refresh,groupId,currentScope,r=>results.get(r.id).status!=='excluded',r=>labels[results.get(r.id).status],explain);
+    function navLabel(r){const s=review.state(r);
+      if(s.reviewed||s.needs_reconfirmation)return review.caption(s);
+      return results.get(r.id).status==='excluded'?'':dirty?'预判待更新':'规则预判 · '+labels[results.get(r.id).status];}
+    message();return {matches:r=>review.matches(r)&&(filter===null||(filter===''?results.get(r.id)?.status!=='excluded':results.get(r.id)?.status===filter)),label:navLabel,
+      groupId,status:r=>results.get(r.id)?.status,clearFilter:()=>{filter=null;review.clearFilter();renderCounts();},detail,payload,isDirty:()=>dirty};
   }
-  return {evaluate,guardPass,csv,attach};
+  return {evaluate,guardPass,csv,decisionSummary,attach};
 })();
 '''

@@ -6,7 +6,10 @@ from pcc_tool.models import PlanNode, QueryCase
 from pcc_tool.plan.assessment import evaluate
 from pcc_tool.plan.empty_replay import replay_reviews, view_evidence
 
-SCHEMA = {"d.t": {"columns": {"id": "INT", "outer_only": "INT"}}, "d.s": {"columns": {"k": "INT", "id": "INT"}}}
+SCHEMA = {"d.t": {"columns": {"id": "INT", "outer_only": "INT"}, "primary_key": ["id"],
+                  "clustered_pk": True, "stats_ready": True},
+          "d.s": {"columns": {"k": "INT", "id": "INT"}, "primary_key": ["id"],
+                  "clustered_pk": True, "stats_ready": True}}
 
 
 def cards(sql, *, nodes=(), deps=(), schema=SCHEMA, parameters=None):
@@ -57,6 +60,71 @@ def test_prepared_and_view_dispatch():
     held = cards("SELECT * FROM v2", deps=[["d", "v2"]], schema=meta)
     assert set(held) == {"D02"} and "视图 d.v" in held["D02"]["reason"]
     assert set(cards("SELECT * FROM v", deps=[["d", "v"]], schema={"d.v": {"columns": {}}})) == {"D10"}
+
+
+@pytest.mark.parametrize("old_reviews", [[], [["D03", "旧版列绑定"]]])
+def test_legacy_view_evidence_needs_definition_for_v8_replay(tmp_path, snapshot, old_reviews):
+    from pcc_tool.artifacts.store import finalize
+    from pcc_tool.models import CaptureBundle, DiffRequest
+    query = QueryCase.create("SELECT id FROM v", "d", dependencies=[["d", "v"]])
+    bundle = CaptureBundle({"objects": [{"schema": "d", "table": "v", "kind": "view"}]}, [query])
+    snaps = {(query.query_id, s): snapshot([["TableDual_1", "0", "root", "", "rows:0"]], s, query.query_id)
+             for s in ("old", "new")}
+    schema = {"d.v": {"view_reviews": old_reviews, "view_dependencies": []}}
+    original, irs = api._summarize([query], snaps, "legacy", [], assessment_schema=schema)
+    root = tmp_path / "legacy"
+    api._write_result(root, original, bundle, snaps, irs, api.Events(None), schema)
+    finalize(root, {"kind": "ComparisonResult", "versions": {"assessment_version": "7"}})
+    result = api.diff(DiffRequest(str(root), str(tmp_path / "replay")))
+    assert result.items[0]["compare_status"] == "same" and result.items[0]["assessment"]["status"] == "review"
+    assert [r["rule_id"] for r in result.items[0]["assessment_evidence"]["mandatory_reviews"]] == ["D10"]
+    repeated = api.diff(DiffRequest(result.output_dir, str(tmp_path / "again")))
+    assert result.items == repeated.items
+
+
+@pytest.mark.parametrize("column", ["id", "x.id"])
+@pytest.mark.parametrize("source", ["SELECT * FROM s", "SELECT a.* FROM s a",
+                                    "SELECT * FROM (SELECT * FROM s) nested",
+                                    "SELECT * FROM s UNION ALL SELECT * FROM s"])
+def test_derived_star_exposes_local_columns(column, source):
+    inner = f"FROM ({source}) AS x"
+    assert set(cards(f"SELECT id FROM t WHERE id < (SELECT MAX({column}) {inner})")) == {"D01"}
+    assert set(cards(f"SELECT id FROM t WHERE EXISTS (SELECT 1 {inner} WHERE {column}>0)")) == {"D02"}
+
+
+def test_star_respects_cte_column_names_and_qualified_join_sources():
+    assert set(cards("WITH x AS (SELECT * FROM s) SELECT id FROM t WHERE EXISTS "
+                     "(SELECT 1 FROM x WHERE id>0)")) == {"D02"}
+    assert set(cards("WITH x(a,b) AS (SELECT * FROM s) SELECT id FROM t WHERE EXISTS "
+                     "(SELECT 1 FROM x WHERE id>0)")) == {"D03"}
+    sql = ("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM "
+           "(SELECT s.* FROM s JOIN t b ON s.id=b.id) x WHERE outer_only>0)")
+    assert "D03" in cards(sql) and "D02" not in cards(sql)
+
+
+@pytest.mark.parametrize("statement", ["UPDATE t SET id=id", "DELETE FROM t"])
+def test_write_exists_has_target_scope(statement):
+    assert set(cards(statement + " WHERE EXISTS (SELECT 1 FROM s WHERE id>0)")) == {"D02", "D11"}
+    assert set(cards(statement + " WHERE NOT EXISTS (SELECT 1 FROM s WHERE k=outer_only)")) == {"D03", "D11"}
+    assert set(cards(statement + " WHERE EXISTS (SELECT 1 FROM s WHERE k=t.id)")) == {"D03", "D11"}
+
+
+@pytest.mark.parametrize("query,depends", [
+    ("SELECT 1, COUNT(*) FROM s", False), ("SELECT COUNT(*), 1 FROM s", False),
+    ("SELECT COALESCE(MAX(id),0) FROM s", False), ("SELECT COUNT(*) FROM s LIMIT 1", False),
+    ("SELECT COUNT(*) FROM s LIMIT 1 OFFSET 1", False),
+    ("SELECT COUNT(*) FROM s GROUP BY id", True), ("SELECT COUNT(*) FROM s HAVING COUNT(*)>0", True),
+    ("SELECT COUNT(*) OVER () FROM s", True), ("SELECT (SELECT COUNT(*) FROM t) FROM s", True),
+])
+def test_exists_aggregate_cardinality_is_scoped_to_its_own_query(query, depends):
+    assert ("D02" in cards(f"SELECT EXISTS ({query})")) is depends
+
+
+def test_exists_ignores_outer_values_used_only_in_the_projection():
+    for projection in ("t.id", "COALESCE(MAX(t.id),0)"):
+        assert set(cards(f"SELECT id FROM t WHERE EXISTS (SELECT {projection} FROM s)")) == {"D02"}
+    assert not cards("SELECT id FROM t WHERE EXISTS (SELECT SUM(t.id+s.k) FROM s)")
+    assert not cards("SELECT id FROM t WHERE EXISTS (SELECT COUNT(*) FROM s WHERE s.k=t.id)")
 
 
 @pytest.mark.parametrize("sql,expected,text", [
@@ -111,7 +179,10 @@ def test_same_dual_is_reviewed_in_summary_with_a_per_side_reason(snapshot):
     assert failed.exit_code == 3
 
 
-def test_same_limit_with_residual_is_advisory_until_selected(snapshot):
+def test_same_limit_with_residual_is_advisory_until_selected(snapshot, tmp_path):
+    import csv
+    from pcc_tool.plan.rule_config import load_policy
+    from pcc_tool.render.report import render_reports
     q = QueryCase.create("SELECT id FROM t WHERE outer_only>2 ORDER BY id LIMIT 20", "d")
     rows = [["Limit_1", "20", "root", "", "offset:0, count:20"],
             ["└─TableReader_2", "20", "root", "", "data:Selection_3"],
@@ -127,3 +198,22 @@ def test_same_limit_with_residual_is_advisory_until_selected(snapshot):
     assert sum(map(int, result.summary["review_basis"].values())) == 0
     assert evaluate(e, ["D05"])["status"] == "review"
     assert "D05" in evaluate(e, ["D05"])["reasons"][0] and evaluate(e, ["D03"])["status"] == "excluded"
+    policy = load_policy(archived={"selected": ["D05"]})
+    selected, irs = api._summarize([q], snaps, "limit", [], assessment_schema=SCHEMA, policy=policy)
+    assert selected.items[0]["requires_review"] and selected.items[0]["compare_status"] == "same"
+    assert selected.items[0]["assessment"]["status"] == "review"
+    assert selected.summary["review_basis"]["selected_runtime"] == "1"
+    assert selected.summary["review_basis"]["unresolved_difference"] == "0"
+    render_reports(tmp_path, selected, [q], snaps, irs, {}, {})
+    with (tmp_path / "differences.csv").open(encoding="utf-8-sig") as data:
+        row, = csv.DictReader(data)
+    assert (row["compare_status"], row["assessment"], row["requires_review"], row["event"]) == ("same", "review", "True", "")
+
+    # If a physical difference is independently unresolved it keeps its own reason.
+    new_plan = snaps[q.query_id, "new"]
+    new_plan.rows = [list(row) for row in new_plan.rows]
+    new_plan.rows[2][-1] = "gt(d.t.outer_only, 3)"
+    changed, _ = api._summarize([q], snaps, "limit", [], assessment_schema=SCHEMA, policy=policy)
+    assert changed.items[0]["assessment"]["uncovered"]
+    assert changed.summary["review_basis"]["unresolved_difference"] == "1"
+    assert changed.summary["review_basis"]["selected_runtime"] == "0"

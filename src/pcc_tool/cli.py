@@ -46,7 +46,7 @@ def parser():
     export.add_argument("--top-n", type=int, default=20)
     export.add_argument("--order-by", type=comma, default=METRICS)
     export.add_argument("--ranking-scope", choices=["global", "per_schema"], default="global")
-    export.add_argument("--schemas", type=comma, default=())
+    export.add_argument("--schemas", type=comma, default=(), help="逗号分隔的业务库名，省略或单独指定 '*' 选择全部业务库")
     export.add_argument("--statement-types", type=comma, default=("select", "update", "delete"))
     export.add_argument("--out", required=True)
     prepare = commands.add_parser("prepare", help="生成 DBA 人工导入材料，不执行写库")
@@ -118,6 +118,8 @@ def main(argv=None):
         if isinstance(result, ComparisonResult):
             code = result.exit_code
             payload = {"run_status": result.run_status, "summary": result.summary, "output_dir": result.output_dir}
+            if result.report_path:
+                payload["report_path"] = result.report_path
         elif command == "export":
             code = 3 if result.manifest["run_status"] == "partial" else 0
             payload = {"run_status": result.manifest["run_status"], "output_dir": result.path}

@@ -90,8 +90,7 @@ def test_incomparable_observations_never_count_as_confirmed_changes(snapshot, tm
     assert result.summary['plan_findings'] == '1'
     assert all(not f['confirmed'] for f in result.items[0]['findings'])
     assert similar_groups(result.items) == []
-    render_reports(tmp_path, result, queries, snapshots, irs, {}, {})
-    text = (tmp_path / 'report.html').read_text()
+    text = render_reports(tmp_path, result, queries, snapshots, irs, {}, {}).read_text()
     assert '<b>1</b><small>存在差异</small>' in text and '<b>3</b><small>无法比对</small>' in text
     assert '未确认的字段观察（不计入差异）' in text and '统计未就绪' in text
     assert '缺少可执行 SQL 样例或完整参数' in text
@@ -137,11 +136,13 @@ def test_rule_report_preserves_facts_escapes_objects_and_retains_distinct_sql(sn
         (access_rows('<img src=x>'), access_rows('<img src=x>', True, ('50', '50')), []),
         (access_rows('other'), access_rows('other', True, ('500', '500')), []),
     ])
-    render_reports(tmp_path, result, queries, snapshots, irs, {}, {})
-    text = (tmp_path / 'report.html').read_text()
+    text = render_reports(tmp_path, result, queries, snapshots, irs, {}, {}).read_text()
     assert '<img src=x>' not in text and '&lt;img src=x&gt;' in text
     assert 'IndexRangeScan' in text and 'TableRangeScan' in text and 'IndexReader' in text and 'TableReader' in text
     assert 'ACCESS_SCAN' in text and '节点对应依据' in text
-    assert '相似差异分组' in text and '不代表自动批量通过' in text
+    assert '相似差异分组' in text and '按同类变化评审' in text
     assert 'data-group="query-1,query-2"' in text
     assert '辅助指标 · 估算行数' in text
+    summary = result.items[0]["change_summary"]
+    assert all(part in summary for part in ("访问路径", "IndexReader", "TableReader", "→", "<img src=x>"))
+    assert "变化摘要" in text

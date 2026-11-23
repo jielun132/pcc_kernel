@@ -94,7 +94,8 @@ def main():
     result, irs = api._summarize(queries, snapshots, digest(fixtures), [], assessment_schema=metadata)
     report = args.out / 'report'
     api._write_result(report, result, bundle, snapshots, irs, api.Events(), metadata)
-    finalize(report, {'kind': 'ComparisonResult', 'versions': VERSIONS, 'run_status': result.run_status, 'fingerprint': result.fingerprint})
+    finalize(report, {'kind': 'ComparisonResult', 'versions': VERSIONS, 'run_status': result.run_status,
+                      'fingerprint': result.fingerprint, 'report_file': result.report_file})
     replay = api.diff(DiffRequest(str(report), str(args.out / 'offline')))
     assert result.items == replay.items and result.summary == replay.summary
     by_id = {item['query_id']: item for item in result.items}
@@ -107,7 +108,7 @@ def main():
     for check in checks:
         print(check['name'], check['expected'], check['actual'], flush=True)
     assert all(check['actual'] == check['expected'] for check in checks), 'Rule controls failed; see archived raw plans'
-    print('Report:', report / 'report.html')
+    print('Report:', report / result.report_file)
 
 
 if __name__ == '__main__':

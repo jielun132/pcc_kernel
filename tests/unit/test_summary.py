@@ -24,6 +24,30 @@ def test_monotonic_late_duplicate_and_cross_instance(summary_row):
     assert queries[0].metrics["keys_approximate"]
 
 
+@pytest.mark.parametrize("schemas", [(), ("*",), ("app",)])
+def test_system_schemas_and_cross_database_references_excluded_before_top_n(summary_row, schemas):
+    from pcc_tool.capture.guard import SYSTEM_SCHEMAS
+    rows = [summary_row(sql_digest="business", table_names="`app`.`t`",
+                        query_sample_text="SELECT 'mysql.user' FROM app.t AS mysql WHERE mysql.id=1")]
+    for system in SYSTEM_SCHEMAS:
+        rows.extend([
+            summary_row(schema_name=system.upper(), sql_digest=system, exec_count="1000"),
+            summary_row(table_names=f"app.t, `{system.upper()}` . `objects`", sql_digest=system+"-table", exec_count="1000"),
+            summary_row(table_names=None, sql_digest=system+"-sample", exec_count="1000",
+                        query_sample_text=f"WITH s AS (SELECT * FROM `{system}`.objects) SELECT * FROM s"),
+            summary_row(query_sample_text=None, sql_digest=system+"-digest", exec_count="1000",
+                        digest_text=f"SELECT id FROM {system}.objects WHERE id = ?"),
+        ])
+    selected, scope, issues = select_queries(rows, schemas=schemas, top_n=1, order_by=("execution_count",), **WINDOW)
+    assert [q.source_digest for q in selected] == ["business"] and selected[0].dependencies == [["app", "t"]]
+    assert scope["visible_digests"] == "1" and set(scope["excluded_system_schemas"]) == SYSTEM_SCHEMAS and not issues
+
+
+def test_mixed_wildcard_rejected_in_sdk(summary_row):
+    with pytest.raises(PCCError, match="单独"):
+        select_queries([summary_row()], schemas=("app", "*"), **WINDOW)
+
+
 def test_key_ignores_window_end_and_pairs_average(summary_row):
     rows = [summary_row(exec_count="10", avg_total_keys="100"),
             summary_row(exec_count="20", sum_latency="200", avg_total_keys="2", summary_end_time="2026-10-08T09:40:00+08:00",

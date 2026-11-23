@@ -186,3 +186,75 @@ def similar_groups(items):
             if item["query_id"] not in group["query_ids"]:
                 group["query_ids"].append(item["query_id"])
     return [group for group in groups.values() if len(group["query_ids"]) > 1]
+
+
+def change_summary(findings, events, old, new):
+    """Describe the old-to-new change near the differing text, even on long lines."""
+    def transition(before, after):
+        a, b = (str(value) if value not in (None, "") else "未列出" for value in (before, after))
+        common = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+        start = max(0, common - 18) if max(len(a), len(b)) > 85 else 0
+
+        def excerpt(value):
+            return ("…" if start else "") + value[start:start+85] + ("…" if len(value) > start+85 else "")
+
+        return excerpt(a) + " → " + excerpt(b)
+
+    def describe(fact):
+        category = fact["category"]
+        before, after = fact["old"], fact["new"]
+        node = (after or before or [{}])[0].get("operator", "计划")
+        event = events[int(fact["event_refs"][0]) - 1]
+        if category == "access_path":
+            def path(nodes):
+                return " / ".join(n["operator"] + (" (" + n["access"] + ")" if n["access"] else "")
+                                  for n in nodes if n["operator"] in ACCESS)
+            left, right = path(before), path(after)
+            if left != right:
+                return "访问路径 " + transition(left, right)
+            return "访问对象 " + transition(event.old, event.new)
+        if category == "join":
+            def join(nodes):
+                return " ".join(filter(None, (nodes[0]["operator"], nodes[0]["role"], nodes[0]["attributes"])))
+            return "连接 " + transition(join(before), join(after))
+        if category == "order":
+            left, right = (" / ".join((n["operator"] + " " + (n["role"] or n["access"])).strip()
+                                      for n in side[1:]) for side in (before, after))
+            if left == right:
+                left, right = " / ".join(event.old), " / ".join(event.new)
+            return "子节点顺序 " + transition(left, right)
+        if category == "structure":
+            return ("新增 " if after else "移除 ") + node
+        if category == "engine":
+            def location(task_engine):
+                task, engine = task_engine
+                return "TiDB 根节点" if task == "root" else task or engine
+            return node + " 执行位置 " + transition(location(event.old), location(event.new))
+        label = {"estimate": node + " 估算行数", "attribute": node + " 属性", "operator": "算子"}.get(category, fact["title"])
+        return label + " " + transition(event.old, event.new)
+
+    priority = ("access_path", "join", "engine", "operator", "structure", "order", "attribute", "estimate", "unclassified")
+    def trunk(ir):
+        nodes = {}
+        branch = ir.roots if ir else []
+        while len(branch) == 1 and len(nodes) < 5:
+            node = branch[0]
+            nodes[node.node_id] = node.operator
+            branch = node.children
+        return nodes
+
+    left, right = trunk(old), trunk(new)
+    path_change = left and right and list(left.values()) != list(right.values())
+    described_path = False
+    parts = []
+    for fact in sorted(findings, key=lambda f: priority.index(f["category"])):
+        if path_change and fact["category"] == "structure" and (
+                any(n["node_id"] in left for n in fact["old"]) or any(n["node_id"] in right for n in fact["new"])):
+            if not described_path:
+                parts.append("计划主干 " + transition(" / ".join(left.values()), " / ".join(right.values())))
+                described_path = True
+        else:
+            parts.append(describe(fact))
+    if len(parts) > 3:
+        parts = parts[:3] + [f"另有 {len(parts)-3} 项，见差异明细"]
+    return "。".join(parts) + "。" if parts else ""

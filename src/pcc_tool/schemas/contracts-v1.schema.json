@@ -75,13 +75,17 @@
     "ComparisonItem": {
       "type": "object", "required": ["query_id", "compare_status", "old", "new", "needs_sample", "issues"],
       "properties": {"query_id": {"type": "string"}, "compare_status": {"enum": ["same", "changed", "incomparable", "not_run"]},
-                     "needs_sample": {"type": "boolean"}, "requires_review": {"type": "boolean"}, "issues": {"type": "array"}}
+                     "needs_sample": {"type": "boolean"}, "requires_review": {"type": "boolean"}, "issues": {"type": "array"},
+                     "change_summary": {"type": "string"},
+                     "text_equivalence": {"type": "array", "items": {"type": "object",
+                       "required": ["rule", "field", "old_node", "new_node", "old", "new"]}}}
     },
     "Manifest": {
       "type": "object", "required": ["kind", "contract_version", "files", "fingerprint", "run_status"],
       "properties": {
         "kind": {"enum": ["CaptureBundle", "ComparisonResult", "Preparation"]}, "contract_version": {"const": "1"},
         "files": {"type": "object", "additionalProperties": {"$ref": "#/$defs/hash"}}, "fingerprint": {"$ref": "#/$defs/hash"},
+        "report_file": {"type": "string"},
         "run_status": {"enum": ["completed", "partial", "blocked", "interrupted"]}
       }
     },

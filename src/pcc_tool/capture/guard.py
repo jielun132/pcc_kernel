@@ -16,7 +16,7 @@ logging.getLogger("sqlglot").propagate = False
 
 DENIED_FUNCTIONS = {"SLEEP", "BENCHMARK", "GET_LOCK", "RELEASE_LOCK", "RELEASE_ALL_LOCKS",
                     "LOAD_FILE", "NEXTVAL", "SETVAL", "NEXT_VALUE_FOR"}
-SYSTEM_SCHEMAS = {"mysql", "information_schema", "performance_schema", "metrics_schema", "sys"}
+SYSTEM_SCHEMAS = {"mysql", "information_schema", "performance_schema", "metrics_schema", "inspection_schema", "sys"}
 
 
 class TiDBValidation(MySQL):

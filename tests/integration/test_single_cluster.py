@@ -180,7 +180,7 @@ def test_two_node_compare_and_offline_parity(live, comparison, monkeypatch):
     monkeypatch.setattr(api, "Database", no_database)
     offline = api.diff(DiffRequest(comparison.output_dir, str(root / "offline")))
     assert offline.summary == comparison.summary and offline.diffs == comparison.diffs
-    for file in ("report.html", "summary.json", "items.jsonl", "diffs.jsonl", "issues.jsonl"):
+    for file in (offline.report_file, "summary.json", "items.jsonl", "diffs.jsonl", "issues.jsonl"):
         assert (root / "offline" / file).is_file()
     assert verify(root / "offline")["business_fingerprint"] == verify(root / "comparison")["business_fingerprint"]
 

@@ -23,9 +23,9 @@ def comparison_method():
             '<li><b>按计划树局部匹配节点。</b>在对应父节点的子节点内，依次尝试完整子树、对象＋算子＋属性、完整后代子树（保留谓词、忽略估算行数）、访问对象、算子＋角色、算子；每步只采用双方唯一的对应。最后只剩一对时局部配对。单子节点包装层增删单独识别。仍有歧义时保留观察并要求复核。</li>'
             '<li><b>保留算子语义。</b>统一 row / JSON 列名、数值格式和已知算子临时编号及引用；不把 FullScan 与 RangeScan、HashJoin 与 MergeJoin 合成同一种算子。当前没有未经验证的跨版本算子等价映射，未知算子或字段按无法完整比较处理。</li>'
             '<li><b>比较属性并归并事实。</b>比较具体算子、表/索引/分区、任务与引擎、Join 角色、子节点顺序、谓词属性和 estRows。同一 SQL 同一访问位置的扫描、父级链路及对象变化归并，保留规则及全部字段证据；其他位置分别计数。估算行数单列为辅助指标。</li>'
-            '<li><b>相似分组只辅助浏览。</b>按差异类别、规则及旧新算子结构分组，不以表名、谓词或估算数值决定相似；每条 SQL 的数据规模、分布及业务场景仍需 DBA 单独复核。没有批量通过或结论继承。</li>'
+            '<li><b>按整条 SQL 评审。</b>文本规则全部覆盖后计入一致。其余差异可按评审组浏览，DBA 确认代表 SQL 后，可将结论应用到当前范围内的同组 SQL。</li>'
             '</ol><p class="overview-note">规则版本 1。规则识别事实，不给出性能优劣或自动批准结论。'
-            '仅 estRows 变化也属于“存在差异”，但只计入辅助指标，不计入访问路径等计划事实项。</p>'
+            '严格比对将 estRows 变化计入差异，估算值单列为辅助指标。</p>'
             '<details><summary>查看固定规则及含义</summary><div class="overview-table-wrap"><table class="overview-table">'
             '<thead><tr><th>规则</th><th>名称</th><th>判定含义</th></tr></thead><tbody>' + rules + '</tbody></table></div></details></div></details>')
 
@@ -109,7 +109,7 @@ def findings_panel(item, events, anchor):
                          + matching + '</section>')
         title = title if complete else '未确认观察 · ' + title
         note = ('估算值不代表实际扫描行数或性能；这些记录不并入访问路径变化。' if kind == 'auxiliary' else
-                '同一访问位置的相关规则归并计数，保留全部证据；结论待 DBA 逐条评审。')
+                '同一访问位置的相关规则归并计数，每一项都可以查看对应字段。')
         sections.append(f'<section class="finding-section {kind}"><h3>{title} · {len(selected)} 项</h3>'
                         f'<p class="overview-note">{note}</p>{"".join(cards)}</section>')
     counts = {}
@@ -144,14 +144,13 @@ def grouping_panel(items, queries):
             fact = facts[member["finding_id"]]
             objects = list(dict.fromkeys(n["access"] for side in ("old", "new") for n in fact[side] if n["access"]))
             rows.append(f'<tr><td><a data-query-link href="#query-{positions[qid]}">SQL #{positions[qid]:02d}</a></td>'
-                        f'<td>{esc(by_query[qid].schema)}</td><td>{esc("；".join(objects) or "未列访问对象")}</td>'
-                        '<td>待逐条评审</td></tr>')
+                        f'<td>{esc(by_query[qid].schema)}</td><td>{esc("；".join(objects) or "未列访问对象")}</td></tr>')
         members = ','.join(f'query-{positions[qid]}' for qid in group["query_ids"])
         output.append(f'<details class="similar-group"><summary>组 {index} · {esc(group["title"])} · '
                       f'{len(group["query_ids"])} 条 SQL / {len(group["members"])} 项事实</summary>'
                       f'<button type="button" data-group="{members}">集中查看本组 SQL</button>'
-                      '<table class="overview-table"><thead><tr><th>SQL</th><th>数据库</th><th>涉及对象</th><th>评审</th></tr></thead>'
+                      '<table class="overview-table"><thead><tr><th>SQL</th><th>数据库</th><th>涉及对象</th></tr></thead>'
                       '<tbody>' + ''.join(rows) + '</tbody></table></details>')
-    return (f'<details class="grouping"><summary>相似差异分组 · {len(groups)} 组</summary><p>仅按规则和算子结构归类，便于集中查看。'
-            '<b>不代表自动批量通过，也不继承其他 SQL 的评审结论。</b>请分别核对表的数据规模、分布、参数和业务场景。</p>'
+    return (f'<details class="grouping"><summary>相似差异分组 · {len(groups)} 组</summary><p>此处按单项差异集中展示。'
+            '要批量评审整条 SQL，请在目录选择“按同类变化评审”。</p>'
             + ''.join(output) + '</details>')

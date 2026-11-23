@@ -9,6 +9,7 @@ from pathlib import Path
 from pcc_tool.models import PCCError, digest, primitive
 from pcc_tool.plan.rule_catalog import (ASSESSMENT_VERSION, DEFAULT_RULES, DEFAULT_THRESHOLDS,
                                         REQUIRED_DATA_RULES, RULE_CATALOG)
+from pcc_tool.plan.text_equivalence import TEXT_RULES
 
 LIMITS = {"min_rows": 1000000000, "max_ratio_pct": 50, "reduction_pct": 99, "estimate_pct": 50}
 BASE_PROFILES = [
@@ -49,6 +50,13 @@ def version(value):
     return str(value).removeprefix("v")
 
 
+def text_rules(value):
+    if (not isinstance(value, list) or any(not isinstance(v, str) or v not in TEXT_RULES for v in value)
+            or len(set(value)) != len(value)):
+        invalid("text_equivalence_rules 必须是不重复的已知文本比对规则 ID 列表")
+    return [key for key in TEXT_RULES if key in value]
+
+
 def unique_object(pairs):
     result = {}
     for key, value in pairs:
@@ -67,10 +75,11 @@ def load_policy(path=None, profile_id=None, versions=None, archived=None):
             invalid("无法读取规则 JSON 配置")
     else:
         raw = copy.deepcopy(archived or {})
-    fields(raw, ("schema_version", "selected", "thresholds", "cards", "profiles", "default_profile"), "规则配置")
+    fields(raw, ("schema_version", "selected", "thresholds", "cards", "profiles", "default_profile", "text_equivalence_rules"), "规则配置")
     if type(raw.get("schema_version", 1)) not in (str, int) or str(raw.get("schema_version", 1)) != "1":
         invalid("不支持的规则配置 schema_version")
     choices = selected(raw.get("selected", DEFAULT_RULES))
+    text_choices = text_rules(raw.get("text_equivalence_rules", []))
     limits = thresholds(raw.get("thresholds", {}), DEFAULT_THRESHOLDS)
     cards = copy.deepcopy(RULE_CATALOG)
     patches = raw.get("cards", {})
@@ -89,7 +98,7 @@ def load_policy(path=None, profile_id=None, versions=None, archived=None):
     profiles = {p["id"]: dict(p) for p in BASE_PROFILES}
     seen = set()
     for entry in supplied:
-        fields(entry, ("id", "label", "old_version", "new_version", "selected", "thresholds"), "profiles")
+        fields(entry, ("id", "label", "old_version", "new_version", "selected", "thresholds", "text_equivalence_rules"), "profiles")
         key = entry.get("id")
         if not isinstance(key, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]{1,80}", key) or key in seen:
             invalid("规则方案 ID 无效或重复")
@@ -112,6 +121,8 @@ def load_policy(path=None, profile_id=None, versions=None, archived=None):
         pairs.add(pair)
         entry["selected"] = selected(entry.get("selected", choices))
         entry["thresholds"] = thresholds(entry.get("thresholds", {}), limits)
+        if "text_equivalence_rules" in raw or "text_equivalence_rules" in entry:
+            entry["text_equivalence_rules"] = text_rules(entry.get("text_equivalence_rules", text_choices))
     actual = {s: version((versions or {}).get(s, "unknown")) for s in ("old", "new")}
     chosen = profile_id or raw.get("default_profile", "auto")
     if chosen == "auto":
@@ -124,5 +135,7 @@ def load_policy(path=None, profile_id=None, versions=None, archived=None):
         rule["default"] = rule["id"] in active["selected"]
     policy = dict(version=ASSESSMENT_VERSION, rules=cards, selected=active["selected"], thresholds=active["thresholds"],
                   profiles=list(profiles.values()), profile_id=chosen, actual_versions=actual, policy_config=primitive(raw))
+    if "text_equivalence_rules" in active:
+        policy.update(text_equivalence_version="1", text_equivalence_rules=active["text_equivalence_rules"])
     policy["rules_fingerprint"] = digest({k: v for k, v in policy.items() if k != "actual_versions"})
     return policy
